@@ -561,6 +561,40 @@ nanogent start
 
 See [DESIGN.md DR-011](DESIGN.md#dr-011-plugins-inject-container-dependencies-via-installsh) for the full rationale and plugin-author checklist.
 
+### Migrating from 0.8.0
+
+v0.8.1 is a non-breaking follow-up to v0.8.0 that adds an **optional** per-plugin container-resource advisory. Nothing in v0.8.0 stops working; if you don't need it, you can ignore everything in this section and `nanogent update` is a no-op.
+
+What v0.8.1 adds:
+
+- Plugins can now ship an optional `resources.json` next to `install.sh` with any of `minMemoryMb`, `minCpus`, `note`.
+- `nanogent build` discovers every `resources.json`, aggregates across all plugins using `max()` (plugins share one container, so the floor is the hungriest plugin's floor — not the sum), and prints an advisory block at the end of the build naming the hungriest plugin for each dimension.
+- The advisory also checks whether `.nanogent/docker-compose.yml` already declares `mem_limit` / `cpus` / `deploy:` — if it doesn't, the operator gets a one-line nudge to add limits there. If it does, the operator gets a one-line reminder to verify the values meet the floor.
+- No file is ever edited. `docker-compose.yml` stays operator-owned. The advisory is pure hint, nothing more.
+- Missing, malformed, or partial `resources.json` files never fail the build — discovery warns and skips.
+
+Example `resources.json` for a plugin that ships an LSP server:
+
+```json
+{
+  "minMemoryMb": 4096,
+  "minCpus": 2,
+  "note": "rust-analyzer LSP + cargo metadata indexing"
+}
+```
+
+What v0.8.0 plugins should do: **probably nothing**. Only ship a `resources.json` if your plugin has a *real* floor that would cause confusing failures (OOM kills mid-turn, runaway CPU thrashing) on a default-sized container. The default claude tool doesn't ship one because it's a CLI shell-out with no meaningful floor — shipping one there would just nag everyone for no reason.
+
+```bash
+# 1. Update nanogent
+npm install -g nanogent@latest
+nanogent update
+
+# 2. Regenerate Dockerfile.generated (unchanged by the update, but this
+#    is when new resources.json advisories would light up if you add one).
+nanogent build
+```
+
 Once running, a client just sends any text to the bot. The chat agent:
 
 1. Decides whether the message is addressed to it (calls `skip` if not)

@@ -271,6 +271,24 @@ export interface PluginInstall {
   scriptPath: string;
 }
 
+/**
+ * Optional per-plugin container resource hint. Each plugin can ship a
+ * `resources.json` next to `install.sh` declaring the minimum RAM/CPU its
+ * tooling needs inside the container. `nanogent build` reads these, aggregates
+ * via max() (plugins share one container, they don't each get their own), and
+ * emits an advisory line — it never edits `docker-compose.yml`. Missing,
+ * malformed, or partial files are fine: discovery warns and skips.
+ */
+export interface PluginResources {
+  root: string;
+  name: string;
+  /** Path relative to .nanogent/, e.g. 'tools/claude/resources.json'. */
+  resourcesPath: string;
+  minMemoryMb?: number;
+  minCpus?: number;
+  note?: string;
+}
+
 export interface BuildOptions {
   cwd?: string;
   logger?: (msg: string) => void;
@@ -281,6 +299,8 @@ export interface BuildResult {
   outputPath: string;
   /** Plugins that contributed an install step. */
   installs: PluginInstall[];
+  /** Plugins that shipped a resources.json advisory. */
+  resources: PluginResources[];
 }
 
 /**
@@ -304,6 +324,102 @@ export function discoverPluginInstalls(nanogentDir: string): PluginInstall[] {
     }
   }
   return installs;
+}
+
+/**
+ * Scan .nanogent/<root>/*\/resources.json for optional per-plugin resource
+ * hints. Missing files → silently skipped (advisory is opt-in). Malformed
+ * JSON or unexpected types → warn via `log` and skip that one file; a bad
+ * advisory should never block `nanogent build`. Returns the same stable
+ * order as `discoverPluginInstalls` so build output is deterministic.
+ */
+export function discoverPluginResources(
+  nanogentDir: string,
+  log: (msg: string) => void = () => { /* silent */ },
+): PluginResources[] {
+  const out: PluginResources[] = [];
+  for (const root of PLUGIN_ROOTS) {
+    const rootDir = join(nanogentDir, root);
+    if (!existsSync(rootDir)) continue;
+    const entries = readdirSync(rootDir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('_') && !e.name.startsWith('.'))
+      .map(e => e.name)
+      .sort();
+    for (const name of entries) {
+      const file = join(rootDir, name, 'resources.json');
+      if (!existsSync(file)) continue;
+      const rel = `${root}/${name}/resources.json`;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(readFileSync(file, 'utf8'));
+      } catch (e) {
+        log(`warning:    ${rel} is not valid JSON — skipping (${(e as Error).message})`);
+        continue;
+      }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        log(`warning:    ${rel} must be a JSON object — skipping`);
+        continue;
+      }
+      const obj = parsed as Record<string, unknown>;
+      const entry: PluginResources = { root, name, resourcesPath: rel };
+      if ('minMemoryMb' in obj) {
+        if (typeof obj.minMemoryMb === 'number' && obj.minMemoryMb > 0 && Number.isFinite(obj.minMemoryMb)) {
+          entry.minMemoryMb = obj.minMemoryMb;
+        } else {
+          log(`warning:    ${rel} has non-numeric/non-positive minMemoryMb — ignoring field`);
+        }
+      }
+      if ('minCpus' in obj) {
+        if (typeof obj.minCpus === 'number' && obj.minCpus > 0 && Number.isFinite(obj.minCpus)) {
+          entry.minCpus = obj.minCpus;
+        } else {
+          log(`warning:    ${rel} has non-numeric/non-positive minCpus — ignoring field`);
+        }
+      }
+      if (typeof obj.note === 'string') entry.note = obj.note;
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+export interface AggregatedResources {
+  /** max() across all plugins that declared minMemoryMb. undefined if none did. */
+  minMemoryMb?: number;
+  /** Plugin name that set the max memory floor — used in the advisory line. */
+  minMemoryMbFrom?: string;
+  minCpus?: number;
+  minCpusFrom?: string;
+}
+
+/**
+ * Aggregate per-plugin resources with max() semantics. Plugins share one
+ * container, so the container's floor is the hungriest plugin's floor — not
+ * the sum. Empty input → empty object (no advisory to emit).
+ */
+export function aggregatePluginResources(resources: PluginResources[]): AggregatedResources {
+  const agg: AggregatedResources = {};
+  for (const r of resources) {
+    if (r.minMemoryMb !== undefined && (agg.minMemoryMb === undefined || r.minMemoryMb > agg.minMemoryMb)) {
+      agg.minMemoryMb = r.minMemoryMb;
+      agg.minMemoryMbFrom = `${r.root}/${r.name}`;
+    }
+    if (r.minCpus !== undefined && (agg.minCpus === undefined || r.minCpus > agg.minCpus)) {
+      agg.minCpus = r.minCpus;
+      agg.minCpusFrom = `${r.root}/${r.name}`;
+    }
+  }
+  return agg;
+}
+
+/**
+ * Cheap, grep-based check for whether docker-compose.yml already declares
+ * any resource limits. We don't parse YAML — we just look for the common
+ * keys operators use. A false negative here just means we print the
+ * advisory when the operator has already acted on it; no harm done.
+ */
+function composeMentionsResourceLimits(composeContent: string): boolean {
+  return /^\s*(mem_limit|cpus|deploy)\s*:/m.test(composeContent);
 }
 
 /** Emit the COPY + RUN pair for a single plugin install. */
@@ -359,8 +475,9 @@ export function runBuild(opts: BuildOptions = {}): BuildResult {
     throw new Error(`${BASE_DOCKERFILE_REL} not found — run \`nanogent init\` first`);
   }
 
+  const nanogentDir = join(cwd, '.nanogent');
   const baseContent = readFileSync(basePath, 'utf8');
-  const installs = discoverPluginInstalls(join(cwd, '.nanogent'));
+  const installs = discoverPluginInstalls(nanogentDir);
   const generated = composeDockerfile(baseContent, installs);
 
   const outputPath = join(cwd, GENERATED_DOCKERFILE_REL);
@@ -375,7 +492,44 @@ export function runBuild(opts: BuildOptions = {}): BuildResult {
     }
   }
 
-  return { outputPath, installs };
+  // Optional per-plugin resource advisories. Opt-in via resources.json next
+  // to install.sh; we never edit docker-compose.yml, we just surface the
+  // numbers at build time so the operator can act on them.
+  const resources = discoverPluginResources(nanogentDir, log);
+  const agg = aggregatePluginResources(resources);
+  if (resources.length > 0) {
+    const composePath = join(nanogentDir, 'docker-compose.yml');
+    const composeSet = existsSync(composePath)
+      ? composeMentionsResourceLimits(readFileSync(composePath, 'utf8'))
+      : false;
+
+    log('');
+    log(`advisory:   ${resources.length} plugin${resources.length === 1 ? '' : 's'} declared resource hints`);
+    for (const r of resources) {
+      const bits: string[] = [];
+      if (r.minMemoryMb !== undefined) bits.push(`${r.minMemoryMb} MB`);
+      if (r.minCpus !== undefined) bits.push(`${r.minCpus} cpus`);
+      const suffix = r.note ? ` — ${r.note}` : '';
+      log(`  + ${r.root}/${r.name}: ${bits.length > 0 ? bits.join(', ') : '(no numeric fields)'}${suffix}`);
+    }
+    if (agg.minMemoryMb !== undefined || agg.minCpus !== undefined) {
+      const parts: string[] = [];
+      if (agg.minMemoryMb !== undefined) {
+        parts.push(`≥ ${agg.minMemoryMb} MB memory (from ${agg.minMemoryMbFrom})`);
+      }
+      if (agg.minCpus !== undefined) {
+        parts.push(`≥ ${agg.minCpus} cpus (from ${agg.minCpusFrom})`);
+      }
+      log(`  → container floor: ${parts.join(', ')}`);
+      if (!composeSet) {
+        log('  → .nanogent/docker-compose.yml has no mem_limit/cpus set; add limits there if the host needs them');
+      } else {
+        log('  → .nanogent/docker-compose.yml already declares resource limits; verify they meet the floor above');
+      }
+    }
+  }
+
+  return { outputPath, installs, resources };
 }
 
 /** Read .nanogent/config.json if present, return empty object otherwise. */

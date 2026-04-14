@@ -11,7 +11,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  composeDockerfile, discoverPluginInstalls, runBuild, runUpdate,
+  aggregatePluginResources, composeDockerfile, discoverPluginInstalls,
+  discoverPluginResources, runBuild, runUpdate,
 } from '../bin/cli.ts';
 
 interface Fixture {
@@ -353,6 +354,178 @@ describe('runBuild', () => {
         () => runBuild({ cwd: f.cwd, logger: () => { /* silent */ } }),
         /Dockerfile not found/,
       );
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('plugin resources advisory', () => {
+  function setupResFixture(): { cwd: string; cleanup: () => void } {
+    const cwd = mkdtempSync(join(tmpdir(), 'nanogent-res-'));
+    return { cwd, cleanup: () => { rmSync(cwd, { recursive: true, force: true }); } };
+  }
+
+  function writePlugin(cwd: string, root: string, name: string, resJson: string | null): void {
+    const dir = join(cwd, '.nanogent', root, name);
+    mkdirSync(dir, { recursive: true });
+    if (resJson !== null) writeFileSync(join(dir, 'resources.json'), resJson);
+  }
+
+  it('discoverPluginResources returns empty when no files exist', () => {
+    const f = setupResFixture();
+    try {
+      writePlugin(f.cwd, 'tools', 'claude', null);
+      const out = discoverPluginResources(join(f.cwd, '.nanogent'));
+      assert.equal(out.length, 0);
+    } finally { f.cleanup(); }
+  });
+
+  it('discoverPluginResources parses valid files', () => {
+    const f = setupResFixture();
+    try {
+      writePlugin(f.cwd, 'tools', 'heavy', JSON.stringify({
+        minMemoryMb: 4096, minCpus: 2, note: 'needs a real runtime',
+      }));
+      const out = discoverPluginResources(join(f.cwd, '.nanogent'));
+      assert.equal(out.length, 1);
+      assert.equal(out[0]?.minMemoryMb, 4096);
+      assert.equal(out[0]?.minCpus, 2);
+      assert.equal(out[0]?.note, 'needs a real runtime');
+      assert.equal(out[0]?.resourcesPath, 'tools/heavy/resources.json');
+    } finally { f.cleanup(); }
+  });
+
+  it('discoverPluginResources warns and skips malformed JSON without failing', () => {
+    const f = setupResFixture();
+    try {
+      writePlugin(f.cwd, 'tools', 'broken', '{ not valid json');
+      writePlugin(f.cwd, 'tools', 'good', JSON.stringify({ minMemoryMb: 2048 }));
+      const logs: string[] = [];
+      const out = discoverPluginResources(join(f.cwd, '.nanogent'), (m) => { logs.push(m); });
+      // Good one still parsed
+      assert.equal(out.length, 1);
+      assert.equal(out[0]?.name, 'good');
+      // Warning emitted for the broken one
+      assert.ok(logs.some(l => l.includes('tools/broken/resources.json') && l.includes('not valid JSON')));
+    } finally { f.cleanup(); }
+  });
+
+  it('discoverPluginResources ignores non-numeric fields with a warning', () => {
+    const f = setupResFixture();
+    try {
+      writePlugin(f.cwd, 'tools', 'weird', JSON.stringify({
+        minMemoryMb: 'a lot', minCpus: -1,
+      }));
+      const logs: string[] = [];
+      const out = discoverPluginResources(join(f.cwd, '.nanogent'), (m) => { logs.push(m); });
+      assert.equal(out.length, 1);
+      assert.equal(out[0]?.minMemoryMb, undefined);
+      assert.equal(out[0]?.minCpus, undefined);
+      assert.ok(logs.some(l => l.includes('minMemoryMb')));
+      assert.ok(logs.some(l => l.includes('minCpus')));
+    } finally { f.cleanup(); }
+  });
+
+  it('aggregatePluginResources takes max across plugins', () => {
+    const agg = aggregatePluginResources([
+      { root: 'tools', name: 'a', resourcesPath: 'tools/a/resources.json', minMemoryMb: 1024, minCpus: 1 },
+      { root: 'tools', name: 'b', resourcesPath: 'tools/b/resources.json', minMemoryMb: 4096, minCpus: 0.5 },
+      { root: 'tools', name: 'c', resourcesPath: 'tools/c/resources.json', minMemoryMb: 2048 },
+    ]);
+    assert.equal(agg.minMemoryMb, 4096);
+    assert.equal(agg.minMemoryMbFrom, 'tools/b');
+    assert.equal(agg.minCpus, 1);
+    assert.equal(agg.minCpusFrom, 'tools/a');
+  });
+
+  it('aggregatePluginResources returns empty object when no plugin declared anything', () => {
+    const agg = aggregatePluginResources([]);
+    assert.equal(agg.minMemoryMb, undefined);
+    assert.equal(agg.minCpus, undefined);
+  });
+
+  const BASE_DF = [
+    'FROM node:24-slim',
+    '# __NANOGENT_PLUGIN_INSTALLS__',
+    'CMD ["node"]',
+    '',
+  ].join('\n');
+
+  function seedNanogent(cwd: string): void {
+    mkdirSync(join(cwd, '.nanogent'), { recursive: true });
+    writeFileSync(join(cwd, '.nanogent/Dockerfile'), BASE_DF);
+  }
+
+  it('runBuild emits no advisory when no plugin shipped resources.json', () => {
+    const f = setupResFixture();
+    try {
+      seedNanogent(f.cwd);
+      const logs: string[] = [];
+      const r = runBuild({ cwd: f.cwd, logger: (m) => { logs.push(m); } });
+      assert.equal(r.resources.length, 0);
+      assert.ok(!logs.some(l => l.includes('advisory:')));
+    } finally { f.cleanup(); }
+  });
+
+  it('runBuild emits advisory with max memory and notes missing compose limits', () => {
+    const f = setupResFixture();
+    try {
+      seedNanogent(f.cwd);
+      // Compose file without any resource limits.
+      writeFileSync(
+        join(f.cwd, '.nanogent/docker-compose.yml'),
+        'services:\n  nanogent:\n    build:\n      context: .\n',
+      );
+      writePlugin(f.cwd, 'tools', 'heavy', JSON.stringify({ minMemoryMb: 4096, note: 'LSP' }));
+      writePlugin(f.cwd, 'tools', 'light', JSON.stringify({ minMemoryMb: 512 }));
+
+      const logs: string[] = [];
+      const r = runBuild({ cwd: f.cwd, logger: (m) => { logs.push(m); } });
+
+      assert.equal(r.resources.length, 2);
+      assert.ok(logs.some(l => l.includes('advisory:') && l.includes('2 plugins')));
+      // Uses the max (4096), not the sum (4608)
+      assert.ok(logs.some(l => l.includes('≥ 4096 MB memory') && l.includes('tools/heavy')));
+      assert.ok(!logs.some(l => l.includes('4608')));
+      // Notes missing compose limits
+      assert.ok(logs.some(l => l.includes('no mem_limit/cpus set')));
+      // Per-plugin note is surfaced
+      assert.ok(logs.some(l => l.includes('LSP')));
+    } finally { f.cleanup(); }
+  });
+
+  it('runBuild notes when compose already declares resource limits', () => {
+    const f = setupResFixture();
+    try {
+      seedNanogent(f.cwd);
+      writeFileSync(
+        join(f.cwd, '.nanogent/docker-compose.yml'),
+        'services:\n  nanogent:\n    build:\n      context: .\n    mem_limit: 2g\n',
+      );
+      writePlugin(f.cwd, 'tools', 'heavy', JSON.stringify({ minMemoryMb: 4096 }));
+
+      const logs: string[] = [];
+      runBuild({ cwd: f.cwd, logger: (m) => { logs.push(m); } });
+
+      assert.ok(logs.some(l => l.includes('already declares resource limits')));
+      assert.ok(!logs.some(l => l.includes('no mem_limit/cpus set')));
+    } finally { f.cleanup(); }
+  });
+
+  it('runBuild with malformed resources.json still succeeds and warns', () => {
+    const f = setupResFixture();
+    try {
+      seedNanogent(f.cwd);
+      writePlugin(f.cwd, 'tools', 'broken', '{{{ not json');
+
+      const logs: string[] = [];
+      const r = runBuild({ cwd: f.cwd, logger: (m) => { logs.push(m); } });
+
+      // Build still produced the Dockerfile
+      assert.ok(existsSync(join(f.cwd, '.nanogent/Dockerfile.generated')));
+      assert.equal(r.resources.length, 0);
+      // Warning was logged, but no advisory block (no valid resources)
+      assert.ok(logs.some(l => l.includes('tools/broken/resources.json') && l.includes('not valid JSON')));
+      assert.ok(!logs.some(l => l.includes('advisory:')));
     } finally { f.cleanup(); }
   });
 });
