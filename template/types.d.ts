@@ -147,6 +147,73 @@ export interface ProviderPlugin {
 }
 
 // ---------------------------------------------------------------------------
+// History store plugin contract — raw append-only message log
+// ---------------------------------------------------------------------------
+//
+// A history store is the canonical, append-only record of what was said.
+// It knows nothing about relevance, windowing, or retrieval — it just stores
+// bytes and gives them back. Memory plugins sit on top and decide what
+// subset to surface to the LLM.
+//
+// Exactly one history store is active per install. See DESIGN.md DR-009a.
+
+export interface HistoryStoreCtx {
+  projectName: string;
+  projectDir: string;
+  stateDir: string;                // .nanogent/state (plugin should namespace under its own subdir)
+  pluginDir: string;               // the plugin's own folder on disk
+  log(...args: unknown[]): void;
+}
+
+export interface HistoryStorePlugin {
+  name: string;
+  init(ctx: HistoryStoreCtx): Promise<void>;
+  append(contactId: string, messages: HistoryMessage[]): Promise<void>;
+  read(contactId: string, opts?: { limit?: number }): Promise<HistoryMessage[]>;
+  retractLast(contactId: string, count: number): Promise<void>;
+  clear(contactId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Memory plugin contract — indexer + retriever over history
+// ---------------------------------------------------------------------------
+//
+// A memory plugin decides what context to surface for the next turn. Naive
+// implementations just return the last N messages from the history store.
+// Smarter ones (vector RAG, GraphRAG, summarisation, mem0-style) build their
+// own index off the `onAppend` callback and return a filtered subset plus
+// optional `systemContext` text injected into the system prompt.
+//
+// Exactly one memory plugin is active per install. See DESIGN.md DR-009b.
+
+export interface MemoryCtx {
+  projectName: string;
+  projectDir: string;
+  stateDir: string;                // .nanogent/state (plugin should namespace under its own subdir)
+  pluginDir: string;
+  history: HistoryStorePlugin;     // injected — memory plugins read history via this handle
+  log(...args: unknown[]): void;
+}
+
+export interface RecallResult {
+  messages: HistoryMessage[];      // goes into provider.chat({ messages })
+  systemContext?: string;          // optional extra text appended to the system prompt
+}
+
+export interface MemoryPlugin {
+  name: string;
+  init(ctx: MemoryCtx): Promise<void>;
+  // Called at turn start. `query` is the latest user text (useful for RAG relevance ranking).
+  recall(contactId: string, query: string): Promise<RecallResult>;
+  // Called whenever new messages are appended to history. Index them if you want.
+  onAppend(contactId: string, messages: HistoryMessage[]): Promise<void>;
+  // Called when the last N appended messages are being retracted (skip / error recovery).
+  onRetract(contactId: string, count: number): Promise<void>;
+  // Called by /clear.
+  onClear(contactId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
 // contacts.json shape
 // ---------------------------------------------------------------------------
 
@@ -176,7 +243,6 @@ export interface Contacts {
 export interface Config {
   projectName?: string;
   chatModel?: string;
-  maxHistory?: number;
   maxTokens?: number;
   docker?: boolean;
 }

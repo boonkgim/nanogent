@@ -11,39 +11,46 @@ For the high-level design *principles* — the "what nanogent is" character — 
 This document is **normative**. If you're writing a channel plugin, a tool, a provider, or extending the core, the decisions below are the rules.
 
 Versions referenced:
-- **v0.3.x** — current implementation. Tools as drop-in folders; Telegram and Anthropic hardcoded in the core runtime.
-- **v0.4.0** — planned. Channels and providers extracted into plugin directories matching the tools pattern. Permission model via `contacts.json`. Multi-channel and single-provider by design.
-
-Where a decision is "planned for v0.4.0", it describes the target state. The current code in `main` may not yet reflect it.
+- **v0.3.x** — Tools as drop-in folders; Telegram and Anthropic hardcoded in the core runtime.
+- **v0.4.0** — Channels and providers extracted into plugin directories. Permission model via `contacts.json`. Multi-channel, single-provider.
+- **v0.4.x → v0.5.0** — Runtime converted to TypeScript (single hand-written `.ts` file, Node 24+ type stripping).
+- **v0.5.0** — History and memory extracted into separate plugin directories. History store is the raw append-only log; memory is the indexer/retriever. Both are exactly-one-active. See [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) and [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
 
 ## Architecture at a glance
 
 ```
 .nanogent/
-  nanogent.mjs        — core runtime
+  nanogent.ts         — core runtime
   prompt.md           — system prompt template
   config.json         — non-secret config (projectName, chatModel, docker, ...)
   contacts.json       — chat allowlist + user mapping + permissions  [v0.4.0+]
+  types.d.ts          — plugin contracts (shared, shipped via `init`)
   .env / .env.example — secrets (gitignored via .nanogent/.gitignore)
   .gitignore          — hides .env and /state/
-  state/              — core runtime state (history, jobs, learnings)
+  state/              — core runtime state (jobs, learnings; history lives under its plugin)
   tools/<name>/       — plugin tools (many active)                    [v0.3.1+]
   channels/<name>/    — plugin channels (many active)                 [v0.4.0]
   providers/<name>/   — plugin AI providers (exactly one active)      [v0.4.0]
+  history/<name>/     — plugin history store  (exactly one active)    [v0.5.0]
+  memory/<name>/      — plugin memory system  (exactly one active)    [v0.5.0]
 ```
 
-Three plugin directories, three extensibility points:
+Five plugin directories, five extensibility points:
 
 | Plugin type | Directory | How many active? | What it does | Status |
 |---|---|---|---|---|
 | **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent (`claude`, `rag`, `search`, ...) | Implemented (v0.3.1) |
-| **Channel** | `channels/<name>/` | Many | Handles a transport (`telegram`, `whatsapp`, `email`, ...) | Planned (v0.4.0) |
-| **Provider** | `providers/<name>/` | Exactly one | Implements the AI chat loop (`anthropic`, `openai`, ...) | Planned (v0.4.0) |
+| **Channel** | `channels/<name>/` | Many | Handles a transport (`telegram`, `whatsapp`, `email`, ...) | Implemented (v0.4.0) |
+| **Provider** | `providers/<name>/` | Exactly one | Implements the AI chat loop (`anthropic`, `openai`, ...) | Implemented (v0.4.0) |
+| **History store** | `history/<name>/` | Exactly one | Raw append-only message log (`jsonl`, `postgres`, ...) | Implemented (v0.5.0) |
+| **Memory** | `memory/<name>/` | Exactly one | Indexer + retriever over history (`naive`, `vector-rag`, `graphrag`, ...) | Implemented (v0.5.0) |
 
 The asymmetry in "how many active" reflects real differences:
 - **Tools are capabilities** — a project can have several (coding, RAG, search, calendar)
 - **Channels are ingress points** — a project can have several (DM via Telegram, email, group on WhatsApp)
 - **Providers are thinking layers** — a chat agent has one reasoning model per turn; multiplexing two providers within one conversation is confused, not a feature
+- **History is the source of truth** — one canonical log per install; multiple stores would split the truth
+- **Memory is a single lens** — the agent reasons from one context model at a time; two memories would disagree on what's relevant
 
 ## Core data model (v0.4.0)
 
@@ -384,6 +391,82 @@ Mention filtering is standard bot etiquette on Telegram, Discord, and Slack. The
 - A plugin on a platform that doesn't have native "mention" semantics (e.g., email) only supports `always` mode — the plugin should ignore `mode: mention` or log a warning
 - The core itself doesn't enforce `mode`; it's a contract between operator config and channel plugin behaviour
 
+### DR-009a: History storage is a separate, pluggable, raw-log concern
+
+**What.** History is stored by a dedicated **history store plugin** under `.nanogent/history/<name>/`. Exactly one history store is active per install. The history store is an **append-only raw log** — it stores messages exactly as they were produced and returns them verbatim. It does **not** rotate, summarise, filter, or re-rank. The default plugin (`history/jsonl`) writes one JSONL file per `contactId`; alternative implementations can back history with a relational DB, a KV store, an object store, etc.
+
+The contract is deliberately minimal:
+
+```ts
+interface HistoryStorePlugin {
+  init(ctx): Promise<void>;
+  append(contactId, messages): Promise<void>;
+  read(contactId, opts?: { limit? }): Promise<HistoryMessage[]>;
+  retractLast(contactId, count): Promise<void>;
+  clear(contactId): Promise<void>;
+}
+```
+
+The core owns `contactId` computation ([DR-002](#dr-002-historymode--shared-vs-per-user)) and treats the string as opaque to the plugin. Message shape is the canonical `HistoryMessage` from `types.d.ts` — role + content, where content is either a string or an array of Anthropic-shaped content blocks (text / tool_use / tool_result).
+
+**Why.** Two separate plugin points (history + memory) instead of one unified "memory" plugin, because storage and retrieval are genuinely different concerns:
+
+- **Storage wants**: durability, portable format, predictable write cost, auditability, reindexability.
+- **Retrieval wants**: relevance ranking, context budgeting, cross-turn synthesis, RAG/graph/summary variants.
+
+Bundling them would force every memory plugin to also solve storage (rewrite JSONL to vector DB, re-implement crash-safe writes, handle file locking, etc.) and would make memory swaps destroy prior conversations. Separating them gives:
+
+1. **Reindex on demand.** Drop the memory index, replay `append` from history, rebuild. Not possible if memory owns storage.
+2. **Memory swap without data loss.** Try vector RAG today, GraphRAG next month — raw conversations survive the swap.
+3. **Portable audit trail.** Operators can `cat` the JSONL regardless of which memory system is active.
+4. **Trivial unit tests.** Feed a fixture history into any memory plugin, assert recall output.
+
+**Consequences.**
+- The core never reads or writes history files directly — every access goes through `history.append / read / retractLast / clear`.
+- Rotation, windowing, and "last N messages" logic do **not** belong in the history store. They are retrieval concerns and live in the memory plugin. History grows forever by default; operator archival/pruning is a separate concern a future plugin can add.
+- `contactId` computation stays in core ([DR-002](#dr-002-historymode--shared-vs-per-user)) — the privacy boundary between shared and per-user histories is a security decision, not a storage decision.
+- **Failure mode**: if `history.append` fails, the core aborts the turn and does not call `memory.onAppend`. History is the source of truth — memory is always recoverable from history, never the other way around.
+- Bundled memory systems (mem0, Letta, MemGPT) that own their own storage can ship alongside a no-op history plugin, but the default recommendation is to keep the JSONL history as an audit trail even then — one write per turn is cheap.
+- `history.retractLast(n)` is the contract for undoing the last N appended messages (used by `skip` and error recovery). The core tracks how many it appended in a turn; plugins just honour the count.
+- **Migration from v0.4.x**: existing `.nanogent/state/history/*.jsonl` files are read unchanged by `history/jsonl` — the on-disk format didn't change, only the location of the code that reads/writes it.
+
+### DR-009b: Memory is a separate pluggable indexer/retriever over history
+
+**What.** A **memory plugin** under `.nanogent/memory/<name>/` is the system that decides what context to surface for the next turn. Exactly one memory plugin is active per install. The memory plugin receives `onAppend` notifications for every new message and returns a `RecallResult` at turn start:
+
+```ts
+interface MemoryPlugin {
+  init(ctx: { history: HistoryStorePlugin, ... }): Promise<void>;
+  recall(contactId, query): Promise<{ messages: HistoryMessage[]; systemContext?: string }>;
+  onAppend(contactId, messages): Promise<void>;
+  onRetract(contactId, count): Promise<void>;
+  onClear(contactId): Promise<void>;
+}
+```
+
+The default plugin (`memory/naive`) reads the last N messages from the history store, applies boundary-aware rotation, and returns them with no `systemContext`. It maintains no index of its own — history *is* the index.
+
+Smarter memory plugins (vector RAG, GraphRAG, summarisation, mem0-style episodic memory, entity extraction) build their own index in `onAppend`, and in `recall` return a short recent window of raw messages plus an optional `systemContext` string containing retrieved context, running summaries, extracted facts, or whatever the retrieval strategy produces.
+
+**Why.** Memory is an active research area — vector RAG, GraphRAG, summarisation, agentic retrieval, episodic/semantic splits, tiered archival like MemGPT. Hardcoding any one of them into the core would either freeze the project on a design that's outdated within a year, or force every user to inherit complexity they don't need. Making memory a plugin point lets the core stay dumb and lets the ecosystem move.
+
+Three design decisions worth calling out:
+
+1. **Recall returns both `messages` AND `systemContext`.** Forcing everything into `messages` corrupts the conversation shape (a summary as a fake assistant turn? fake user turn?). A separate `systemContext` slot lets plugins inject retrieved excerpts, summaries, or entity facts as system-prompt text while keeping the message array semantically clean.
+
+2. **Memory receives the history store via ctx injection.** Memory plugins can read history directly (`ctx.history.read(contactId)`) for bootstrap/reindex/fallback behaviour. They don't need to maintain a shadow copy.
+
+3. **Memory owns rotation and windowing.** The old v0.4.x `rotateHistory` / `MAX_HISTORY` logic moved into `memory/naive/index.ts`. This unlocked a real simplification: the history store no longer pretends to be a "recent window" — it's an append-only log, full stop. RAG memories don't rotate at all.
+
+**Consequences.**
+- The core's per-turn loop is: `memory.recall → provider.chat → commit new messages via history.append + memory.onAppend → loop if tool_use`. Only the memory plugin decides what the LLM sees.
+- **`systemContext` and prompt caching**: Anthropic prompt caching invalidates on any change to the system prompt bytes before the cache breakpoint. The core places `systemContext` *after* the cached base prompt so a volatile memory context doesn't nuke the cache on every turn. Plugin authors who return long `systemContext` strings should still structure them with a stable prefix followed by the volatile part.
+- **Failure mode**: if `memory.onAppend` or `memory.onRetract` fails, the core logs and continues. The memory index can always be rebuilt from history, so an out-of-sync index is a soft failure, not a data-loss event. This recoverability only exists because history is a separate plugin.
+- **Cross-turn consistency**: memory plugins see every message the core commits, including assistant turns, tool uses, tool results, and `[SYSTEM]` notices. Plugins that embed text for retrieval should filter content blocks appropriately.
+- **`/clear` semantics**: `/clear` calls both `history.clear(contactId)` and `memory.onClear(contactId)`. A memory plugin that persists across `/clear` (e.g. a long-term entity store) should ignore `onClear` or handle it as a soft signal — but the default is to wipe.
+- **Query for relevance ranking**: `recall(contactId, query)` passes the plain latest user text. RAG plugins use it; naive memory ignores it. Plugins should not assume `query` is the full turn context — it's just the trigger text.
+- **Not a cache**: memory is a retrieval system, not a cache of history. Two memory plugins can coexist during migration by running both and comparing, but only one is ever active in production (exactly-one rule).
+
 ---
 
 ## Guidance for plugin authors
@@ -423,6 +506,36 @@ Providers implement the AI chat loop used by nanogent's chat agent. Plugin autho
 - Honour `cache_control` markers in `system` and `tools` if your provider supports caching; ignore them otherwise (log a debug line noting they were present)
 - Don't try to multiplex multiple backends at the core level — if you want fallback (Anthropic → OpenAI on error), wrap both backends **inside a single plugin** that handles fallback internally. The core sees one provider.
 
+### Writing a history store plugin (v0.5.0+)
+
+Read [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) first.
+
+**Checklist:**
+
+- [ ] Implement the full `HistoryStorePlugin` contract: `init`, `append`, `read`, `retractLast`, `clear`
+- [ ] `append` is the hot path — keep it fast; batch writes if your backend has per-call overhead
+- [ ] `read(contactId, { limit })` should honour the `limit` hint by returning at most that many of the **most recent** messages (tail, not head)
+- [ ] `retractLast(contactId, count)` must be exact — the core tracks how many messages it committed in a turn and expects to undo them precisely
+- [ ] Treat `contactId` as opaque — the core computes it and owns the privacy semantics
+- [ ] Never rotate, summarise, or filter. Windowing is the memory plugin's job.
+- [ ] Keep plugin-local state (locks, indices, etc.) under `<plugin-dir>/state/` and ship a `.gitignore`
+
+### Writing a memory plugin (v0.5.0+)
+
+Read [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history) first.
+
+**Checklist:**
+
+- [ ] Implement the full `MemoryPlugin` contract: `init`, `recall`, `onAppend`, `onRetract`, `onClear`
+- [ ] Use `ctx.history` for bootstrap/reindex — never maintain a shadow copy of raw messages
+- [ ] `recall` returns `{ messages, systemContext? }` — keep `messages` in valid Anthropic shape (no orphan `tool_result` at head)
+- [ ] If you inject dynamic text via `systemContext`, structure it as `stable prefix + volatile suffix` to preserve prompt caching
+- [ ] `onAppend` runs on every committed message (including assistant turns, tool_use, tool_result, `[SYSTEM]` notes) — filter the ones you care about
+- [ ] `onRetract` must be reversible with `onAppend` — if you embedded messages, remove their embeddings
+- [ ] `onClear` should wipe per-contact state; long-term stores that persist across `/clear` should document that deviation
+- [ ] Log errors but don't throw — the core treats memory failures as recoverable (index can always be rebuilt from history)
+- [ ] Keep plugin-local state under `<plugin-dir>/state/` and namespace by `contactId`
+
 ### Email plugin — specific guidance
 
 See [DR-004](#dr-004-email-channel-should-use-per-thread-chatids-with-shared-history). Quick summary:
@@ -445,7 +558,7 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 - **Admin-convenience `link_contact` CLI command** — operators edit `contacts.json` directly in v0.4.0. A CLI wrapper is a candidate for v0.4.x.
 - **Hot-reload of `contacts.json`** — file-watch or mtime-check for on-the-fly updates. Probably v0.4.1.
 - **Per-(user, chat) role hierarchies** — use separate nanogent installs for different trust tiers. If the separate-install pattern proves insufficient, revisit.
-- **Per-user learnings scoping** — learnings are currently global. Per-contact scoping might come later if prompt-injection-via-learning becomes a real problem.
+- **Per-user learnings scoping** — learnings are currently global. Per-contact scoping might come later if prompt-injection-via-learning becomes a real problem. (Note: once v0.5.0 memory plugins land, per-contact scoping is most naturally implemented as a memory plugin that treats learnings as structured context rather than as a core change.)
 - **Provider-level fallback as a core feature** — handled inside a single provider plugin, not core. Waiting for a concrete use case.
 - **Tool-level audit logging** — structured audit trail beyond log greps. Not until someone asks.
 - **Dynamic runtime permission updates** without restart — low priority; requires hot-reload plumbing.
@@ -457,5 +570,6 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 ## Revision history
 
 - **0.1 (2026-04-14)** — Initial draft capturing decisions from the v0.4.0 design discussion. Channels and providers as plugins; permission model via `contacts.json`; email guidance; historyMode semantics.
+- **0.2 (2026-04-14)** — Added DR-009a (history storage is a separate pluggable raw log) and DR-009b (memory is a separate pluggable indexer/retriever). Captures the v0.5.0 split of history and memory into two exactly-one-active plugin directories, the recall/append/retractLast/clear contract, `systemContext` in `RecallResult`, cache-control placement guidance, and the "history is source of truth, memory is recoverable" consistency model.
 
 When adding a new decision or updating an existing one, add a line here with the date and a one-sentence summary.

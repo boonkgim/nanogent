@@ -1,6 +1,6 @@
-// Unit tests for the pure helpers exported from template/nanogent.ts.
-// These functions are the three-layer permission model (DR-007), the
-// boundary-aware history rotation (DR-004), and the .env parser.
+// Unit tests for the pure helpers exported from the nanogent core + default
+// plugins. Covers the three-layer permission model (DR-005), boundary-aware
+// history rotation (DR-009b / memory/naive), and the .env parser.
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,9 +9,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  findChat, resolveAccess, rotateHistory, isTurnStart, sanitize, unique,
+  findChat, resolveAccess, sanitize, unique,
   loadEnv, loadConfig, loadContacts,
 } from '../template/nanogent.ts';
+import { rotateHistory, isTurnStart } from '../template/memory/naive/index.ts';
 import type { Contacts, HistoryMessage } from '../template/types.d.ts';
 
 // ---------------------------------------------------------------------------

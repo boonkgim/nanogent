@@ -1,9 +1,9 @@
 // nanogent.ts — per-project chat agent core runtime.
 //
 // Owns:
-//   - plugin loaders (tools / channels / providers)
+//   - plugin loaders (tools / channels / providers / history / memory)
 //   - contacts.json parsing + access control
-//   - turn queue + per-chat history routing
+//   - turn queue + per-contact turn routing
 //   - chat-agent tool-use loop (delegates one round-trip at a time to provider)
 //   - core tools (skip, check_job_status, cancel_job, learn)
 //   - job registry with crash recovery + async completion routing
@@ -13,20 +13,22 @@
 //   - any specific transport (that's in .nanogent/channels/<name>/)
 //   - any specific AI provider (that's in .nanogent/providers/<name>/)
 //   - any specific capability (that's in .nanogent/tools/<name>/)
+//   - history storage format (that's in .nanogent/history/<name>/)
+//   - retrieval / windowing / RAG (that's in .nanogent/memory/<name>/)
 //
 // See DESIGN.md at the repo root for decision rationale.
 
 import {
   readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, unlinkSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 import type {
   ActiveJob, AccessDecision, ChannelCtx, ChannelPlugin, ChatEntry, Config, Contacts,
-  ContentBlock, HistoryMessage, IncomingMessage, ProviderPlugin, TextBlock, ToolCtx,
-  ToolPlugin, ToolSchema, ToolUseBlock,
+  ContentBlock, HistoryMessage, HistoryStorePlugin, IncomingMessage, MemoryPlugin,
+  ProviderPlugin, TextBlock, ToolCtx, ToolPlugin, ToolSchema, ToolUseBlock,
 } from './types.d.ts';
 
 // ---------------------------------------------------------------------------
@@ -40,8 +42,9 @@ const PROMPT_PATH    = '.nanogent/prompt.md';
 const TOOLS_DIR      = '.nanogent/tools';
 const CHANNELS_DIR   = '.nanogent/channels';
 const PROVIDERS_DIR  = '.nanogent/providers';
+const HISTORY_DIR    = '.nanogent/history';
+const MEMORY_DIR     = '.nanogent/memory';
 const STATE_DIR      = '.nanogent/state';
-const HISTORY_DIR    = `${STATE_DIR}/history`;
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
 const JOBS_PATH      = `${STATE_DIR}/jobs.json`;
 
@@ -51,12 +54,10 @@ let config: Config = {};
 let contacts: Contacts = { alwaysAllowed: ['skip'], users: {}, chats: {} };
 let PROJECT_NAME = 'nanogent';
 let CHAT_MODEL   = 'claude-haiku-4-5';
-let MAX_HISTORY  = 80;
 let MAX_TOKENS   = 1024;
 
 function bootstrap(): void {
-  mkdirSync(STATE_DIR,   { recursive: true });
-  mkdirSync(HISTORY_DIR, { recursive: true });
+  mkdirSync(STATE_DIR, { recursive: true });
 
   // Load .env into process.env so plugins can read their own keys.
   for (const [k, v] of Object.entries(loadEnv(ENV_PATH))) {
@@ -68,7 +69,6 @@ function bootstrap(): void {
 
   PROJECT_NAME = config.projectName || 'nanogent';
   CHAT_MODEL   = process.env.NANOGENT_CHAT_MODEL  || config.chatModel   || 'claude-haiku-4-5';
-  MAX_HISTORY  = Number(process.env.NANOGENT_MAX_HISTORY || config.maxHistory || 80);
   MAX_TOKENS   = Number(process.env.NANOGENT_MAX_TOKENS  || config.maxTokens  || 1024);
 }
 
@@ -197,70 +197,6 @@ export function unique<T>(arr: T[]): T[] {
 }
 
 // ---------------------------------------------------------------------------
-// History (per contactId)
-// ---------------------------------------------------------------------------
-
-const historyCache = new Map<string, HistoryMessage[]>();
-
-function historyPath(contactId: string): string {
-  return join(HISTORY_DIR, `${contactId.replace(/\//g, '__')}.jsonl`);
-}
-
-function loadHistoryFor(contactId: string): HistoryMessage[] {
-  const cached = historyCache.get(contactId);
-  if (cached) return cached;
-  const p = historyPath(contactId);
-  let h: HistoryMessage[] = [];
-  if (existsSync(p)) {
-    try {
-      h = readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as HistoryMessage);
-    } catch (e) { log('history load error', contactId, (e as Error)?.message || e); }
-  }
-  historyCache.set(contactId, h);
-  return h;
-}
-
-function saveHistoryFor(contactId: string): void {
-  let h = historyCache.get(contactId) || [];
-  if (h.length > MAX_HISTORY) {
-    h = rotateHistory(h, MAX_HISTORY);
-    historyCache.set(contactId, h);
-  }
-  const p = historyPath(contactId);
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, h.map(m => JSON.stringify(m)).join('\n') + '\n');
-}
-
-function clearHistoryFor(contactId: string): void {
-  historyCache.set(contactId, []);
-  try { unlinkSync(historyPath(contactId)); } catch { /* ignore */ }
-}
-
-export function isTurnStart(message: HistoryMessage): boolean {
-  if (message.role !== 'user') return false;
-  if (typeof message.content === 'string') return true;
-  if (!Array.isArray(message.content)) return false;
-  return !message.content.some((b: ContentBlock) => b?.type === 'tool_result');
-}
-
-/**
- * Boundary-aware rotation — never leaves an orphan tool_result at head.
- */
-export function rotateHistory(h: HistoryMessage[], maxHistory: number): HistoryMessage[] {
-  if (h.length <= maxHistory) return h;
-  const minStart = h.length - maxHistory;
-  for (let i = minStart; i < h.length; i++) {
-    const msg = h[i];
-    if (msg && isTurnStart(msg)) return h.slice(i);
-  }
-  for (let i = h.length - 1; i >= 0; i--) {
-    const msg = h[i];
-    if (msg && isTurnStart(msg)) return h.slice(i);
-  }
-  return [];
-}
-
-// ---------------------------------------------------------------------------
 // Plugin loaders
 // ---------------------------------------------------------------------------
 
@@ -268,6 +204,8 @@ const tools = new Map<string, ToolPlugin | ToolSchema>();
 const toolDirs = new Map<string, string>();
 const channels = new Map<string, ChannelPlugin>();
 let provider: ProviderPlugin | null = null;
+let history: HistoryStorePlugin | null = null;
+let memory: MemoryPlugin | null = null;
 
 interface LoadedPlugin<T> {
   plugin: T;
@@ -373,6 +311,51 @@ async function loadAllPlugins(): Promise<void> {
     die(`provider ${provider.name}: missing chat() method`);
   }
   log(`loaded provider: ${provider.name}`);
+
+  // History store plugins — exactly one
+  const historyEntries = await loadPluginsFromDir<HistoryStorePlugin>(HISTORY_DIR, 'history');
+  if (historyEntries.length === 0) {
+    die('no history store loaded — install exactly one history plugin under .nanogent/history/');
+  }
+  if (historyEntries.length > 1) {
+    log(`warning: multiple history stores found (${historyEntries.map(h => h.plugin.name).join(', ')}) — using first: ${historyEntries[0]!.plugin.name}`);
+  }
+  const historyEntry = historyEntries[0]!;
+  history = historyEntry.plugin;
+  if (typeof history.append !== 'function' || typeof history.read !== 'function') {
+    die(`history ${history.name}: missing required methods`);
+  }
+  await history.init({
+    projectName: PROJECT_NAME,
+    projectDir:  process.cwd(),
+    stateDir:    STATE_DIR,
+    pluginDir:   historyEntry.dir,
+    log:         (...args) => { log(`[history:${history!.name}]`, ...args); },
+  });
+  log(`loaded history: ${history.name}`);
+
+  // Memory plugins — exactly one
+  const memoryEntries = await loadPluginsFromDir<MemoryPlugin>(MEMORY_DIR, 'memory');
+  if (memoryEntries.length === 0) {
+    die('no memory plugin loaded — install exactly one memory plugin under .nanogent/memory/');
+  }
+  if (memoryEntries.length > 1) {
+    log(`warning: multiple memory plugins found (${memoryEntries.map(m => m.plugin.name).join(', ')}) — using first: ${memoryEntries[0]!.plugin.name}`);
+  }
+  const memoryEntry = memoryEntries[0]!;
+  memory = memoryEntry.plugin;
+  if (typeof memory.recall !== 'function') {
+    die(`memory ${memory.name}: missing recall() method`);
+  }
+  await memory.init({
+    projectName: PROJECT_NAME,
+    projectDir:  process.cwd(),
+    stateDir:    STATE_DIR,
+    pluginDir:   memoryEntry.dir,
+    history,
+    log:         (...args) => { log(`[memory:${memory!.name}]`, ...args); },
+  });
+  log(`loaded memory: ${memory.name}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +387,7 @@ function persistActiveJob(): void {
   } catch (e) { log('job persist error', (e as Error)?.message || e); }
 }
 
-function recoverInterruptedJob(): void {
+async function recoverInterruptedJob(): Promise<void> {
   if (!existsSync(JOBS_PATH)) return;
   let stale: RuntimeJob | null = null;
   try {
@@ -414,12 +397,11 @@ function recoverInterruptedJob(): void {
   if (!stale?.jobId || !stale?.origin?.contactId) return;
   const elapsed = Math.round((Date.now() - (stale.startedAt || Date.now())) / 1000);
   log(`recovered interrupted job: ${stale.jobId} (${stale.toolName}, "${stale.title}", ~${elapsed}s old)`);
-  const h = loadHistoryFor(stale.origin.contactId);
-  h.push({
+  const note: HistoryMessage = {
     role: 'user',
     content: `[SYSTEM] Tool '${stale.toolName}' (job ${stale.jobId}, "${stale.title}") was INTERRUPTED by a restart after ~${elapsed}s. The job's final status is unknown — any file changes it made before the restart are still on disk, but we don't have its output. If the user asks about it, acknowledge the interruption and offer to retry.`,
-  });
-  saveHistoryFor(stale.origin.contactId);
+  };
+  await commitMessages(stale.origin.contactId, [note]);
 }
 
 interface RegisterJobArgs {
@@ -555,7 +537,7 @@ function makeToolCtx(origin: Origin, toolDir: string): ToolCtx {
 // Chat-agent turn execution
 // ---------------------------------------------------------------------------
 
-function buildSystemPrompt(): TextBlock[] {
+function buildSystemPrompt(memoryContext?: string): TextBlock[] {
   const base = existsSync(PROMPT_PATH) ? readFileSync(PROMPT_PATH, 'utf8') : DEFAULT_SYSTEM_PROMPT;
   const project = `\n\n## Project\nYou are operating inside the "${PROJECT_NAME}" nanogent project.`;
   const learnings = loadLearnings();
@@ -564,9 +546,46 @@ function buildSystemPrompt(): TextBlock[] {
     : '';
   const learnSection = learnings.trim() ? `\n\n${learnings.trim()}` : '';
   const dynamic = `${project}${learnSection}${jobState}`;
+  // Cache breakpoint goes on the stable base prompt only. The dynamic core
+  // block (learnings + job state) and the memory plugin's systemContext sit
+  // after the breakpoint because they can change between turns.
   const blocks: TextBlock[] = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
   if (dynamic) blocks.push({ type: 'text', text: dynamic });
+  if (memoryContext && memoryContext.trim()) {
+    blocks.push({ type: 'text', text: `\n\n## Memory\n${memoryContext.trim()}` });
+  }
   return blocks;
+}
+
+/**
+ * Commit new messages to the history store, then notify the memory plugin.
+ * History is the source of truth; memory is a derived view. If the memory
+ * index fails to update, we log and continue — it can be rebuilt from history.
+ */
+async function commitMessages(contactId: string, messages: HistoryMessage[]): Promise<void> {
+  if (!history || !memory) throw new Error('history/memory not loaded');
+  if (messages.length === 0) return;
+  await history.append(contactId, messages);
+  try {
+    await memory.onAppend(contactId, messages);
+  } catch (e) {
+    log(`memory onAppend error (${contactId}):`, (e as Error)?.message || e);
+  }
+}
+
+/**
+ * Retract the last `count` messages from history and tell memory to
+ * invalidate its index entries for them. Used by skip + error recovery.
+ */
+async function retractMessages(contactId: string, count: number): Promise<void> {
+  if (!history || !memory) throw new Error('history/memory not loaded');
+  if (count <= 0) return;
+  await history.retractLast(contactId, count);
+  try {
+    await memory.onRetract(contactId, count);
+  } catch (e) {
+    log(`memory onRetract error (${contactId}):`, (e as Error)?.message || e);
+  }
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are a friendly project assistant talking to a client via chat. You have access to tools for doing real work — prefer calling them over making things up. If a message is side chatter not addressed to you, call skip. User messages are always prefixed with [Name]: — use the name to address speakers and tell participants apart in group chats.`;
@@ -587,28 +606,42 @@ function toolSchemasFor(effectiveTools: string[]): ToolSchema[] {
 }
 
 /**
- * Run one chat-agent turn against the given contact's history.
+ * Run one chat-agent turn for the given contact.
  * Returns the assistant text to send back (or null if skipped).
+ *
+ * The caller must have already committed the triggering user message via
+ * commitMessages() before invoking runTurn — this way runTurn's own recall()
+ * call sees it. `triggerMessageCount` is how many messages the caller
+ * appended for this turn (typically 1), so skip/error paths can retract
+ * them cleanly.
  */
-async function runTurn(origin: Origin, effectiveTools: string[]): Promise<string | null> {
-  if (!provider) throw new Error('provider not loaded');
-  const history = loadHistoryFor(origin.contactId);
+async function runTurn(
+  origin: Origin,
+  effectiveTools: string[],
+  triggerMessageCount: number,
+  queryText: string,
+): Promise<string | null> {
+  if (!provider || !memory) throw new Error('provider/memory not loaded');
   const toolList = toolSchemasFor(effectiveTools);
+
+  // Ask the memory plugin for the context to send this turn. `queryText`
+  // is the plain latest user text — RAG plugins use it for relevance ranking.
+  const recalled = await memory.recall(origin.contactId, queryText);
+  const messages: HistoryMessage[] = recalled.messages.slice();
 
   let response = await provider.chat({
     model:     CHAT_MODEL,
     maxTokens: MAX_TOKENS,
-    system:    buildSystemPrompt(),
-    messages:  history,
+    system:    buildSystemPrompt(recalled.systemContext),
+    messages,
     tools:     toolList,
   });
 
   while (response.stopReason === 'tool_use') {
     const skipped = response.content.some(b => b.type === 'tool_use' && b.name === 'skip');
     if (skipped) {
-      // Drop the trigger message from history — behave as if we never saw it.
-      history.pop();
-      saveHistoryFor(origin.contactId);
+      // Drop the triggering user message(s) — behave as if we never saw them.
+      await retractMessages(origin.contactId, triggerMessageCount);
       log(`[${origin.contactId}] skip`);
       return null;
     }
@@ -625,23 +658,23 @@ async function runTurn(origin: Origin, effectiveTools: string[]): Promise<string
       });
     }
 
-    history.push(
+    const midTurnMessages: HistoryMessage[] = [
       { role: 'assistant', content: response.content },
       { role: 'user',      content: toolResults },
-    );
-    saveHistoryFor(origin.contactId);
+    ];
+    messages.push(...midTurnMessages);
+    await commitMessages(origin.contactId, midTurnMessages);
 
     response = await provider.chat({
       model:     CHAT_MODEL,
       maxTokens: MAX_TOKENS,
-      system:    buildSystemPrompt(),
-      messages:  history,
+      system:    buildSystemPrompt(recalled.systemContext),
+      messages,
       tools:     toolList,
     });
   }
 
-  history.push({ role: 'assistant', content: response.content });
-  saveHistoryFor(origin.contactId);
+  await commitMessages(origin.contactId, [{ role: 'assistant', content: response.content }]);
 
   const text = response.content
     .filter((b): b is TextBlock => b.type === 'text')
@@ -708,14 +741,14 @@ async function processTrigger(trigger: Trigger): Promise<void> {
   }
 
   const origin: Origin = { channel, chatId, contactId };
-  const history = loadHistoryFor(contactId);
 
   const prefix = isSystemTrigger ? '' : `[${displayName}]: `;
-  history.push({ role: 'user', content: prefix + text });
-  saveHistoryFor(contactId);
+  const triggerText = prefix + text;
+  const triggerMessage: HistoryMessage = { role: 'user', content: triggerText };
+  await commitMessages(contactId, [triggerMessage]);
 
   try {
-    const reply = await runTurn(origin, perTurnTools);
+    const reply = await runTurn(origin, perTurnTools, 1, triggerText);
     if (reply) {
       const ch = channels.get(channel);
       if (ch) await ch.sendMessage(chatId, reply);
@@ -752,7 +785,11 @@ async function handleSlash(text: string, origin: Origin): Promise<void> {
   }
   if (text === '/clear') {
     if (activeJob) { await say('⚠️ a job is running — /cancel first, then /clear'); return; }
-    clearHistoryFor(origin.contactId);
+    if (history) await history.clear(origin.contactId);
+    if (memory) {
+      try { await memory.onClear(origin.contactId); }
+      catch (e) { log('memory onClear error', (e as Error)?.message || e); }
+    }
     await say('✨ history cleared — next message starts fresh');
     return;
   }
@@ -842,7 +879,7 @@ const channelStopFns: Array<() => void> = [];
 async function main(): Promise<void> {
   bootstrap();
   await loadAllPlugins();
-  recoverInterruptedJob();
+  await recoverInterruptedJob();
 
   for (const [name, channel] of channels) {
     try {

@@ -88,6 +88,14 @@ export const MANIFEST: ManifestEntry[] = [
   // Default provider
   { src: 'providers/anthropic/index.ts',  dest: '.nanogent/providers/anthropic/index.ts',  type: 'plugin' },
   { src: 'providers/anthropic/README.md', dest: '.nanogent/providers/anthropic/README.md', type: 'plugin' },
+
+  // Default history store (raw append-only message log)
+  { src: 'history/jsonl/index.ts',  dest: '.nanogent/history/jsonl/index.ts',  type: 'plugin' },
+  { src: 'history/jsonl/README.md', dest: '.nanogent/history/jsonl/README.md', type: 'plugin' },
+
+  // Default memory plugin (indexer + retriever over the history store)
+  { src: 'memory/naive/index.ts',  dest: '.nanogent/memory/naive/index.ts',  type: 'plugin' },
+  { src: 'memory/naive/README.md', dest: '.nanogent/memory/naive/README.md', type: 'plugin' },
 ];
 
 function copyFromManifest(manifest: ManifestEntry[]): void {

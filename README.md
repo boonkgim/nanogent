@@ -138,7 +138,7 @@ your-project/
     .env.example              ← template for secrets — committed
     .env                      ← actual secrets — gitignored via .nanogent/.gitignore
     .gitignore                ← hides .env and state/
-    state/                    ← runtime state (history, jobs, learnings) — gitignored
+    state/                    ← runtime state (jobs, learnings) — gitignored
     tools/
       claude/                 ← default coding tool
         index.ts
@@ -149,6 +149,14 @@ your-project/
         README.md
     providers/
       anthropic/              ← default AI provider plugin
+        index.ts
+        README.md
+    history/
+      jsonl/                  ← default history store (raw append-only log)
+        index.ts
+        README.md
+    memory/
+      naive/                  ← default memory plugin (recent-window retrieval)
         index.ts
         README.md
 ```
@@ -213,8 +221,9 @@ ANTHROPIC_API_KEY=sk-ant-...
 - `projectName` — identifier for this install; surfaces in logs, system prompt, and tool context
 - `docker` — whether `nanogent start` uses compose or plain node (overridable via `--docker`/`--node`)
 - `chatModel` — Anthropic model for the chat-agent routing layer. Default `claude-haiku-4-5` (cheap + fast)
-- `maxHistory` — turns kept in history before boundary-aware rotation
 - `maxTokens` — max output tokens per chat-agent turn
+
+> **Note on `maxHistory`**: v0.4.x had a `maxHistory` knob here. In v0.5.0, windowing is owned by the memory plugin, not the core. Set it via `NANOGENT_MEMORY_WINDOW` (read by `memory/naive`) or swap in a different memory plugin. See [DR-009b](DESIGN.md#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
 
 **`.nanogent/contacts.json`** (access control + identity — committed):
 
@@ -409,6 +418,39 @@ nanogent start
 **If you hand-modified any plugin `index.mjs` file**, port those changes to the new `index.ts` before deleting the `.mjs`. `nanogent update` will skip updating a locally-modified `.mjs` → `.ts` plugin since the byte-compare check fails on a file that doesn't exist yet — so you'll see the new `.ts` version dropped cleanly, and your custom `.mjs` sitting alongside, ignored. Diff them by hand and port.
 
 **Plugin author note:** if you wrote a custom tool / channel / provider, rename `index.mjs` → `index.ts` and add types by importing from `../../types.d.ts`. See the shipped plugins for reference.
+
+### Migrating from 0.5.0
+
+v0.6.0 splits history storage and memory retrieval into two separate plugin directories. The core no longer reads or writes history files directly — everything goes through `history/<name>/` (raw append-only log) and `memory/<name>/` (indexer + retriever). This unlocks pluggable memory systems: vector RAG, GraphRAG, summarisation, mem0-style memories, etc. See [DESIGN.md DR-009a/b](DESIGN.md#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) for the full rationale.
+
+**The default plugins (`history/jsonl` + `memory/naive`) preserve v0.5.0 behaviour byte-for-byte.** Existing `.nanogent/state/history/*.jsonl` files are read unchanged — no data migration needed.
+
+```bash
+# 1. Update nanogent
+npm install -g nanogent@latest
+
+# 2. Run the update — it drops the new history/jsonl and memory/naive plugins,
+#    and updates the core to the pluggable version. Config / contacts / prompt
+#    are preserved as always.
+nanogent update
+
+# 3. Restart — history and learnings survive
+nanogent start
+```
+
+**Breaking changes worth calling out:**
+
+- Two new **required** plugin directories: `.nanogent/history/` and `.nanogent/memory/`. Exactly one plugin must live in each, or the runtime exits at startup. `nanogent update` drops the defaults automatically.
+- `config.json`'s `maxHistory` field is **no longer read** by the core. Windowing is now a memory-plugin concern. To tune the default window, set `NANOGENT_MEMORY_WINDOW=N` in `.env`, or swap `memory/naive` for a smarter memory plugin.
+- The `rotateHistory` / `isTurnStart` helpers moved from `nanogent.ts` to `memory/naive/index.ts`. If you imported them in a custom test file or plugin, update the import path.
+
+**Why this is worth it:**
+
+- You can now swap in vector RAG, GraphRAG, or mem0-style memories without touching the core or losing history
+- History is a portable audit trail — operators can `cat` `.nanogent/state/history/*.jsonl` regardless of which memory system is active
+- Memory indices are recoverable: drop the index, replay `append` from history, rebuild
+
+See the new READMEs at [`.nanogent/history/jsonl/`](template/history/jsonl/README.md) and [`.nanogent/memory/naive/`](template/memory/naive/README.md) for plugin-author guidance.
 
 Once running, a client just sends any text to the bot. The chat agent:
 
