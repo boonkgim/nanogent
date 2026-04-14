@@ -7,4 +7,4 @@ RUN apt-get update \
 
 WORKDIR /workspace
 
-CMD ["node", "nanogent.mjs"]
+CMD ["node", ".nanogent/nanogent.mjs"]

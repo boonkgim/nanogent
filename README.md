@@ -1,6 +1,6 @@
 # nanogent
 
-A **per-project chat agent** reachable via Telegram, with pluggable tools. Zero npm dependencies. Decentralised by design — every project gets its own listener, its own prompt, its own tool set, its own lifecycle.
+A **per-project chat agent** reachable via Telegram, with pluggable tools. Zero npm dependencies. Decentralised by design — every project gets its own listener, its own prompt, its own tool set, its own lifecycle. The whole install lives in **one directory (`.nanogent/`)** you can commit, copy between projects, or delete wholesale.
 
 By default, nanogent ships with one tool: **`claude`**, which delegates coding tasks to [Claude Code](https://docs.claude.com/claude-code). You can add more tools (`rag`, `search`, `opencode`, etc.) by dropping `.mjs` files into `.nanogent/tools/` — the core runtime never needs to change.
 
@@ -61,67 +61,126 @@ Most Telegram→agent tools run a **single central process** with a config mappi
 
 ## Install & run
 
-Two launchers, same runtime. Both work the same from the user's side; pick whichever fits your box.
-
-### Option A — Node (default, zero npm deps)
+One command drops everything into a single `.nanogent/` directory — your project root stays untouched. Node is the default; docker is a config flip, not a separate install.
 
 ```bash
 cd your-project
-npx nanogent init              # drops nanogent.mjs, .env.example, .nanogent-prompt.md, .nanogent/tools/claude.mjs
-cp .env.example .env           # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, ANTHROPIC_API_KEY
-$EDITOR .nanogent-prompt.md    # customise the system prompt for this project / client
-nanogent start                 # or: node nanogent.mjs
+npx nanogent init                       # drops .nanogent/ (runtime, prompt, config, tools, Dockerfile, compose)
+cp .nanogent/.env.example .nanogent/.env # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, ANTHROPIC_API_KEY
+$EDITOR .nanogent/prompt.md              # tailor the system prompt for this project / client
+nanogent start                           # reads .nanogent/config.json to choose node or docker mode
 ```
 
-To keep it running in the background, use any process supervisor:
+What lands in your project:
+
+```
+your-project/
+  .nanogent/
+    nanogent.mjs         ← runtime (readable, auditable, committed to git)
+    config.json          ← non-secret settings (docker, chatModel, etc.) — committed
+    prompt.md            ← system prompt — committed
+    Dockerfile           ← dropped always; inert unless config.docker=true
+    docker-compose.yml   ← same
+    tools/
+      claude.mjs         ← default coding tool — committed
+    .env.example         ← template for secrets — committed
+    .env                 ← actual secrets — gitignored via .nanogent/.gitignore
+    .gitignore           ← hides .env and state/
+    state/               ← runtime state (history, jobs, learnings) — gitignored
+```
+
+**Your project root is untouched** — nothing nanogent-related lives outside `.nanogent/`. Teams commit `.nanogent/` as a unit to share prompt, tools, and config; runtime state stays local.
+
+### Node vs Docker
+
+`nanogent start` picks the mode automatically based on `.nanogent/config.json`:
+
+```json
+{ "docker": false }     // run as a node process in the current shell
+{ "docker": true }      // run in a container via docker compose
+```
+
+Override at the command line without editing config:
 
 ```bash
-nohup node nanogent.mjs > nanogent.log 2>&1 &   # quick & dirty
-pm2 start nanogent.mjs --name nanogent          # or pm2
+nanogent start --node      # force node mode
+nanogent start --docker    # force docker mode
 ```
 
-### Option B — Docker (sandboxed, Node 24)
-
-Same flow, but both the chat agent and the `claude` tool run inside a container with your project bind-mounted at `/workspace`. Recommended for VPS / VM / Pi setups where you'd rather not run `--dangerously-skip-permissions` directly on the host.
+**Background supervision** (node mode):
 
 ```bash
-cd your-project
-npx nanogent init --docker     # drops everything above + Dockerfile + docker-compose.yml
-cp .env.example .env           # fill in all three keys (Telegram + Anthropic)
-$EDITOR .nanogent-prompt.md
-claude                         # one-time: log in on the host so ~/.claude exists
-nanogent start --docker        # or: docker compose up --build
+nohup node .nanogent/nanogent.mjs > nanogent.log 2>&1 &    # quick & dirty
+pm2 start .nanogent/nanogent.mjs --name nanogent           # or pm2
 ```
 
-The compose file bind-mounts:
+**Docker specifics:** the container binds the project root (`..` from `.nanogent/`'s perspective) as `/workspace`, and mounts `~/.claude` + `~/.claude.json` so the `claude` tool can reuse your host auth. Recommended for VPS / VM / Pi setups where you'd rather not run `--dangerously-skip-permissions` directly on the host.
 
-- `.` → `/workspace` — the project the tools work in
-- `~/.claude` → `/root/.claude` — your Claude Code auth (read from the host)
-- `~/.claude.json` → `/root/.claude.json` — per-user config
+**Auth on a headless VM:** SSH in, run `claude` once on the host, complete the login flow, and `~/.claude` will exist on the VM. The container reuses it on every boot — no token plumbing required.
 
-**Auth on a headless VM:** SSH in, run `claude` once, complete the login flow, and `~/.claude` will exist on the VM. The container reuses it on every boot — no token plumbing required.
-
-To run detached: `docker compose up -d --build`. To follow logs: `docker compose logs -f`.
+Detached docker: `nanogent start --docker` ... then Ctrl+C. Or `cd .nanogent && docker compose up -d --build`. Follow logs with `docker compose logs -f`.
 
 ## Configuration
 
-A `.env` file in the project root:
+Two files, two concerns:
+
+**`.nanogent/.env`** (secrets — gitignored):
 
 ```
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 TELEGRAM_ALLOWED_CHAT_IDS=123456789,987654321
 ANTHROPIC_API_KEY=sk-ant-...
-# NANOGENT_CHAT_MODEL=claude-haiku-4-5   # optional, default is haiku
-# NANOGENT_MAX_TOKENS=1024                # optional
-# NANOGENT_MAX_HISTORY=80                 # optional — turns kept in history before rotation
 ```
 
 - `TELEGRAM_BOT_TOKEN` — required
 - `TELEGRAM_ALLOWED_CHAT_IDS` — comma-separated chat IDs. **Leave empty to allow anyone** (not recommended)
 - `ANTHROPIC_API_KEY` — required, for the chat agent itself
-- `NANOGENT_CHAT_MODEL` — optional, defaults to `claude-haiku-4-5`
 
-The **system prompt** lives in `.nanogent-prompt.md` — edit it to describe the project, the client, the tone, and anything specific to this engagement. It's loaded verbatim on every turn.
+**`.nanogent/config.json`** (non-secrets — committed):
+
+```json
+{
+  "docker": false,
+  "chatModel": "claude-haiku-4-5",
+  "maxHistory": 80,
+  "maxTokens": 1024
+}
+```
+
+- `docker` — whether `nanogent start` uses compose or plain node (overridable via `--docker`/`--node`)
+- `chatModel` — Anthropic model for the chat-agent routing layer. Default `claude-haiku-4-5` (cheap + fast). Override to `claude-sonnet-4-5` or `claude-opus-4-6` for smarter chat at higher cost.
+- `maxHistory` — turns kept in `state/history.jsonl` before boundary-aware rotation kicks in
+- `maxTokens` — max output tokens per chat-agent turn
+
+Env vars (`NANOGENT_CHAT_MODEL`, `NANOGENT_MAX_HISTORY`, `NANOGENT_MAX_TOKENS`) still work as one-off overrides without editing the committed config file.
+
+**Already have secrets in a root `.env`?** Nanogent never reads the project's root `.env` — it only looks at `.nanogent/.env`. Three options to avoid duplication:
+
+1. Copy the keys into `.nanogent/.env` (simplest)
+2. Symlink: `ln -s ../.env .nanogent/.env`
+3. Set them as real environment variables (systemd unit, pm2 ecosystem, docker `environment:`) — the runtime falls back to `process.env` for every key, so no `.env` file is strictly required
+
+**The system prompt** lives in `.nanogent/prompt.md`. Edit it to describe the project, the client, the tone, and anything specific to this engagement. It's loaded verbatim on every turn (with the stable base cached via Anthropic prompt caching).
+
+### Migrating from 0.2.x
+
+0.2.x dropped files at the project root (`nanogent.mjs`, `.nanogent-prompt.md`) alongside `.nanogent/`. v0.3.0 consolidates everything under `.nanogent/`. To migrate an existing 0.2.x install:
+
+```bash
+# preserve your customised prompt
+mv .nanogent-prompt.md .nanogent/prompt.md
+
+# drop the old root-level runtime and docker files
+rm -f nanogent.mjs Dockerfile docker-compose.yml
+
+# re-run init to drop the new runtime + config.json into .nanogent/
+npx nanogent init
+
+# move your secrets into .nanogent/.env
+mv .env .nanogent/.env   # or just copy the keys over
+
+# your .nanogent/state/history.jsonl + learnings.md are preserved as-is
+```
 
 ## How clients talk to it
 
@@ -220,14 +279,16 @@ The chat agent itself is ~20 LOC of Anthropic API loop + a small tool dispatch t
 Ctrl+C                # or: pm2 stop nanogent / kill <pid>
 
 # stop (docker)
-docker compose down
+cd .nanogent && docker compose down
 
 # fully remove from a project
-rm -rf nanogent.mjs .nanogent .nanogent-prompt.md .env
-rm -f Dockerfile docker-compose.yml   # if you used --docker
+nanogent uninstall                 # confirms, then deletes .nanogent/
+nanogent uninstall -f              # same, skip confirmation
+# or manually:
+rm -rf .nanogent
 ```
 
-Uninstalling is deleting files. That's still the whole point.
+Uninstalling is deleting one directory. That's still the whole point.
 
 ## Security notes
 

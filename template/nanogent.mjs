@@ -16,16 +16,21 @@ import { randomUUID } from 'node:crypto';
 // Config
 // ---------------------------------------------------------------------------
 
-const env = loadEnv('.env');
+const env = loadEnv('.nanogent/.env');
+const config = loadConfig('.nanogent/config.json');
+
 const TELEGRAM_TOKEN = env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_ALLOWED = new Set(
   (env.TELEGRAM_ALLOWED_CHAT_IDS || process.env.TELEGRAM_ALLOWED_CHAT_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean),
 );
 const ANTHROPIC_KEY = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
-const CHAT_MODEL = env.NANOGENT_CHAT_MODEL || process.env.NANOGENT_CHAT_MODEL || 'claude-haiku-4-5';
-const MAX_HISTORY = Number(env.NANOGENT_MAX_HISTORY || process.env.NANOGENT_MAX_HISTORY || 80);
-const MAX_TOKENS = Number(env.NANOGENT_MAX_TOKENS || process.env.NANOGENT_MAX_TOKENS || 1024);
+
+// Non-secret settings: config.json is the source of truth, env vars can override
+// one-off without editing the committed config file.
+const CHAT_MODEL  = process.env.NANOGENT_CHAT_MODEL  || env.NANOGENT_CHAT_MODEL  || config.chatModel  || 'claude-haiku-4-5';
+const MAX_HISTORY = Number(process.env.NANOGENT_MAX_HISTORY || env.NANOGENT_MAX_HISTORY || config.maxHistory || 80);
+const MAX_TOKENS  = Number(process.env.NANOGENT_MAX_TOKENS  || env.NANOGENT_MAX_TOKENS  || config.maxTokens  || 1024);
 
 if (!TELEGRAM_TOKEN) die('missing TELEGRAM_BOT_TOKEN in .env');
 if (!ANTHROPIC_KEY) die('missing ANTHROPIC_API_KEY in .env');
@@ -38,7 +43,7 @@ const STATE_DIR = '.nanogent/state';
 const HISTORY_PATH = `${STATE_DIR}/history.jsonl`;
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
 const JOBS_PATH = `${STATE_DIR}/jobs.json`;
-const PROMPT_PATH = '.nanogent-prompt.md';
+const PROMPT_PATH = '.nanogent/prompt.md';
 const TOOLS_DIR = '.nanogent/tools';
 
 mkdirSync(STATE_DIR, { recursive: true });
@@ -618,6 +623,16 @@ function loadEnv(path) {
     out[l.slice(0, i).trim()] = l.slice(i + 1).trim().replace(/^["']|["']$/g, '');
   }
   return out;
+}
+
+function loadConfig(path) {
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e) {
+    console.error(`[nanogent] warning: failed to parse ${path}: ${e?.message || e}`);
+    return {};
+  }
 }
 
 // ---------------------------------------------------------------------------

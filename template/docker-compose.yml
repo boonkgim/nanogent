@@ -6,9 +6,9 @@ services:
     env_file: .env
     working_dir: /workspace
     volumes:
-      # the project folder you want claude to work in
-      - .:/workspace
-      # reuse the host's claude auth (run `claude` once on the host first)
+      # The parent of .nanogent/ is the project root — that's what claude works in.
+      - ..:/workspace
+      # Reuse the host's claude auth (run `claude` once on the host first).
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.claude.json:/root/.claude.json
-    command: ["node", "nanogent.mjs"]
+    command: ["node", ".nanogent/nanogent.mjs"]

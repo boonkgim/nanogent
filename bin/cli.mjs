@@ -1,29 +1,32 @@
 #!/usr/bin/env node
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import {
+  copyFileSync, existsSync, mkdirSync, readFileSync, readSync, rmSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 const args = process.argv.slice(2);
 const cmd = args[0] || 'help';
-const docker = args.includes('--docker');
 const here = dirname(fileURLToPath(import.meta.url));
 const tplDir = join(here, '..', 'template');
 
 const usage = `
 nanogent — per-project chat agent with pluggable tools, reachable via Telegram
 
-  nanogent init             drop nanogent.mjs + default tool + prompt + .env.example
-  nanogent init --docker    also drop Dockerfile + docker-compose.yml
-  nanogent start            run the listener (node)
-  nanogent start --docker   run the listener in a docker container
+  nanogent init           drop everything into .nanogent/ (node + docker files, plus prompt, config, tools)
+  nanogent start          run the listener — reads .nanogent/config.json to choose node or docker mode
+  nanogent start --docker force docker mode (ignores config.json)
+  nanogent start --node   force node mode (ignores config.json)
+  nanogent uninstall      delete .nanogent/ after confirmation
+  nanogent uninstall -f   delete .nanogent/ without confirmation
 
 after init:
-  1. cp .env.example .env
+  1. cp .nanogent/.env.example .nanogent/.env
   2. fill TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, ANTHROPIC_API_KEY
-  3. edit .nanogent-prompt.md for this project / client
-  4. nanogent start            (or: node nanogent.mjs)
-     nanogent start --docker   (or: docker compose up -d --build)
+  3. edit .nanogent/prompt.md for this project / client
+  4. optionally flip "docker": true in .nanogent/config.json
+  5. nanogent start
 
 in-chat (once running):
   any text    → routed through the chat agent, which may delegate to tools
@@ -33,23 +36,23 @@ in-chat (once running):
   /help       show command list
 
 to stop:  Ctrl+C   (or: kill <pid> / pm2 stop / docker compose down)
-to remove: rm -rf nanogent.mjs .nanogent .nanogent-prompt.md .env [Dockerfile docker-compose.yml]
+to remove: nanogent uninstall   (or: rm -rf .nanogent)
 `;
 
 /**
- * Manifest: template source path → destination path (relative to cwd).
- * Some destinations rename (e.g. template/nanogent-prompt.md → .nanogent-prompt.md).
+ * Manifest: template source → destination (relative to cwd).
+ * Rename semantics are baked in — template filenames are flat, installed
+ * filenames are scoped under .nanogent/.
  */
-const BASE_MANIFEST = [
-  { src: 'nanogent.mjs',       dest: 'nanogent.mjs' },
-  { src: '.env.example',       dest: '.env.example' },
-  { src: 'nanogent-prompt.md', dest: '.nanogent-prompt.md' },
+const MANIFEST = [
+  { src: 'nanogent.mjs',       dest: '.nanogent/nanogent.mjs' },
+  { src: 'prompt.md',          dest: '.nanogent/prompt.md' },
+  { src: 'config.json',        dest: '.nanogent/config.json' },
+  { src: '.env.example',       dest: '.nanogent/.env.example' },
+  { src: 'gitignore',          dest: '.nanogent/.gitignore' },   // npm strips .gitignore from packages, so ship it as `gitignore` and rename on install
+  { src: 'Dockerfile',         dest: '.nanogent/Dockerfile' },
+  { src: 'docker-compose.yml', dest: '.nanogent/docker-compose.yml' },
   { src: 'tools/claude.mjs',   dest: '.nanogent/tools/claude.mjs' },
-];
-
-const DOCKER_MANIFEST = [
-  { src: 'Dockerfile',         dest: 'Dockerfile' },
-  { src: 'docker-compose.yml', dest: 'docker-compose.yml' },
 ];
 
 function copyFromManifest(manifest) {
@@ -66,30 +69,81 @@ function copyFromManifest(manifest) {
   }
 }
 
+/** Read .nanogent/config.json if present, return empty object otherwise. */
+function readConfig() {
+  try {
+    return JSON.parse(readFileSync(join(process.cwd(), '.nanogent', 'config.json'), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/** Simple blocking stdin prompt, no dependencies. */
+function confirm(prompt) {
+  process.stdout.write(prompt);
+  const buf = Buffer.alloc(32);
+  let n = 0;
+  try { n = readSync(0, buf, 0, buf.length, null); } catch { return false; }
+  const ans = buf.toString('utf8', 0, n).trim().toLowerCase();
+  return ans === 'y' || ans === 'yes';
+}
+
 if (cmd === 'init') {
-  const manifest = docker ? [...BASE_MANIFEST, ...DOCKER_MANIFEST] : BASE_MANIFEST;
-  copyFromManifest(manifest);
-  const next = docker
-    ? '\nnext: cp .env.example .env && nanogent start --docker'
-    : '\nnext: cp .env.example .env && nanogent start';
-  console.log(next);
+  copyFromManifest(MANIFEST);
+  console.log([
+    '',
+    'next:',
+    '  cp .nanogent/.env.example .nanogent/.env',
+    '  $EDITOR .nanogent/.env          # fill in tokens and ANTHROPIC_API_KEY',
+    '  $EDITOR .nanogent/prompt.md     # tailor the prompt for this project / client',
+    '  nanogent start',
+  ].join('\n'));
 } else if (cmd === 'start') {
-  if (docker) {
-    if (!existsSync(join(process.cwd(), 'docker-compose.yml'))) {
-      console.error('docker-compose.yml not found in cwd — run `nanogent init --docker` first');
+  // Mode selection: explicit flag > config.json > node default
+  const explicitDocker = args.includes('--docker');
+  const explicitNode   = args.includes('--node');
+  let useDocker;
+  if (explicitDocker) useDocker = true;
+  else if (explicitNode) useDocker = false;
+  else useDocker = !!readConfig().docker;
+
+  if (useDocker) {
+    const composePath = join(process.cwd(), '.nanogent', 'docker-compose.yml');
+    if (!existsSync(composePath)) {
+      console.error('.nanogent/docker-compose.yml not found — run `nanogent init` first');
       process.exit(1);
     }
-    spawn('docker', ['compose', 'up', '--build'], { stdio: 'inherit' })
+    spawn('docker', ['compose', '-f', composePath, 'up', '--build'], { stdio: 'inherit' })
       .on('exit', c => process.exit(c ?? 0));
   } else {
-    const script = join(process.cwd(), 'nanogent.mjs');
+    const script = join(process.cwd(), '.nanogent', 'nanogent.mjs');
     if (!existsSync(script)) {
-      console.error('nanogent.mjs not found in cwd — run `nanogent init` first');
+      console.error('.nanogent/nanogent.mjs not found — run `nanogent init` first');
       process.exit(1);
     }
     spawn(process.execPath, [script], { stdio: 'inherit' })
       .on('exit', c => process.exit(c ?? 0));
   }
+} else if (cmd === 'uninstall') {
+  const target = join(process.cwd(), '.nanogent');
+  if (!existsSync(target)) {
+    console.log('.nanogent/ not found — nothing to uninstall');
+    process.exit(0);
+  }
+  const force = args.includes('--force') || args.includes('-f');
+  if (!force) {
+    const ok = confirm(
+      'This will permanently delete .nanogent/\n' +
+      '(including your prompt, config, tools, chat history, and learnings).\n' +
+      'Proceed? [y/N]: ',
+    );
+    if (!ok) {
+      console.log('aborted');
+      process.exit(0);
+    }
+  }
+  rmSync(target, { recursive: true, force: true });
+  console.log('removed: .nanogent/');
 } else {
   console.log(usage);
   if (cmd !== 'help' && cmd !== '--help' && cmd !== '-h') process.exit(1);
