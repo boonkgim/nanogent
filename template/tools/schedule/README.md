@@ -53,11 +53,24 @@ to the same conversation. A schedule created in a Telegram DM with Alice
 always fires in that DM, even if the same agent is reachable through other
 channels.
 
-## When there's no scheduler
+## How it works internally
 
-If the operator hasn't installed a scheduler plugin (`.nanogent/scheduler/`
-is empty), this tool returns a clear error on every call. The `schedule`
-tool is installed by default but is inert without a scheduler backend.
+Unlike most tools, the `schedule` tool is both reactive (the agent calls
+`execute()` via `create`/`list`/`cancel`) and proactive (a minute-resolution
+tick loop inside its `start()` hook fires due schedules back into the chat
+via the `fireSystemTurn` primitive handed over in `ToolStartCtx`). All
+state lives under this plugin's own folder:
+
+```
+.nanogent/tools/schedule/state/
+  schedules.json   — definitions (the rules the agent created)
+  log.jsonl        — append-only execution log (claimed/completed/failed)
+```
+
+Core knows nothing about scheduling — it only calls `start()` once at boot
+and `stop()` at shutdown. See [DR-014](../../../../DESIGN.md#dr-014) for
+the minimal-coupling rationale and [DR-010](../../../../DESIGN.md#dr-010)
+for the proactive-trigger design.
 
 ## Why a single tool with actions instead of three
 

@@ -1,5 +1,6 @@
 {
   "name": "jsonl",
   "type": "history",
-  "description": "Append-only JSONL history store (one file per contact)"
+  "description": "Append-only JSONL history store (one file per contact, under the plugin's own state/ dir)",
+  "files": ["index.ts", "README.md", "gitignore"]
 }

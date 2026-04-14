@@ -15,9 +15,10 @@ Versions referenced:
 - **v0.4.0** — Channels and providers extracted into plugin directories. Permission model via `contacts.json`. Multi-channel, single-provider.
 - **v0.4.x → v0.5.0** — Runtime converted to TypeScript (single hand-written `.ts` file, Node 24+ type stripping).
 - **v0.5.0** — History and memory extracted into separate plugin directories. History store is the raw append-only log; memory is the indexer/retriever. Both are exactly-one-active. See [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) and [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
-- **v0.7.0** — Scheduler introduced as an optional (zero-or-one) plugin type. Time-based proactive triggers are now a first-class concern: the agent manages schedules conversationally via the bundled `schedule` tool, a core tick loop fires due schedules through the shared `fireSystemTurn` entry point, and execution state is stored as an append-only log separate from the rules file. See [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source).
+- **v0.7.0** — Scheduler introduced as an optional (zero-or-one) plugin type. Time-based proactive triggers become a first-class concern: the agent manages schedules conversationally via the bundled `schedule` tool, a core tick loop fires due schedules through the shared `fireSystemTurn` entry point, and execution state is stored as an append-only log separate from the rules file. **This shape was reversed in v0.11.0 — see [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook).**
 - **v0.8.0** — Container dependencies made pluggable. The core `Dockerfile` becomes a base stub with a marker line; each plugin can ship an optional `install.sh` next to its `index.ts`, and a new `nanogent build` CLI command composes the real `Dockerfile.generated` by splicing every plugin's install step into the base. The `@anthropic-ai/claude-code` install moves out of core and into `tools/claude/install.sh` — swapping in a different coding harness (e.g. `tools/opencode/`) no longer requires editing the core Dockerfile. See [DR-011](#dr-011-plugins-inject-container-dependencies-via-installsh).
 - **v0.9.0** — Docker becomes the only supported runtime. The host-node path, the `--node` / `--docker` start flags, and the `docker` field in `config.json` are removed. Rationale: plugin `install.sh` scripts can run `apt-get`, `npm install -g`, and write to system paths, so running them on the host is exactly the pollution Docker was added to prevent. Making Docker mandatory eliminates a dual-install contract (host vs container) and collapses the test matrix to one runtime. See [DR-012](#dr-012-docker-is-the-only-supported-runtime).
+- **v0.11.0** — Core↔plugin coupling tightened: the typed `SchedulerPlugin` seam is removed, the scheduler collapses into a self-contained `tools/schedule` that owns CRUD, tick loop, and state under its own plugin directory. `ToolPlugin` gains an optional lifecycle hook (`start(ctx)` returning an optional stop fn); `ToolStartCtx` hands the plugin `pluginDir` + a `fireSystemTurn` primitive. `HistoryStoreCtx` and `MemoryCtx` drop their `stateDir` field — plugins now write state under `pluginDir/state/`, matching the convention `tools/claude` already used. Two new principles land: [DR-014](#dr-014-minimal-core-plugin-coupling) (core provides primitives, plugins own implementation details) and [DR-015](#dr-015-portable-state-via-per-type-data-contracts) (each plugin type defines a canonical `Portable<T>` envelope so alternative backends can migrate data between themselves). DR-010 is rewritten as a reversal of the v0.7.0 scheduler-plugin design.
 
 ## Architecture at a glance
 
@@ -30,27 +31,28 @@ Versions referenced:
   types.d.ts          — plugin contracts (shared, shipped via `init`)
   .env / .env.example — secrets (gitignored via .nanogent/.gitignore)
   .gitignore          — hides .env and /state/
-  state/              — core runtime state (jobs, learnings; history and schedules live under their plugins' control but under this dir)
+  state/              — core-owned runtime state only (jobs.json, learnings.md). Per DR-014, plugins own their state under their plugin dirs, not here.
   tools/<name>/       — plugin tools (many active)                    [v0.3.1+]
+  tools/<name>/state/ — plugin-owned runtime state (per DR-014)       [v0.11.0]
   channels/<name>/    — plugin channels (many active)                 [v0.4.0]
   providers/<name>/   — plugin AI providers (exactly one active)      [v0.4.0]
   history/<name>/     — plugin history store  (exactly one active)    [v0.5.0]
   memory/<name>/      — plugin memory system  (exactly one active)    [v0.5.0]
-  scheduler/<name>/   — plugin scheduler     (zero or one active)     [v0.7.0]
 ```
+
+Proactive behavior (scheduled triggers, webhooks, watchers) is no longer a separate plugin type — it lives inside whichever tool plugin wants it, via the optional `ToolPlugin.start(ctx)` lifecycle hook (v0.11.0, see [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook) and [DR-014](#dr-014-minimal-coreplugin-coupling)). The bundled `tools/schedule` is the reference implementation.
 
 Each installed plugin directory contains a required `plugin.json` (name, type, optional description and file list) — see [DR-013](#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data). Core installation (`nanogent init`) and plugin installation (`nanogent plugin add`) go through the same resolver + installer pipeline; shipped defaults live in `template/profiles/default.json` as data, not as a hardcoded list in `bin/cli.ts`.
 
-Six plugin directories, six extensibility points:
+Five plugin directories, five extensibility points:
 
 | Plugin type | Directory | How many active? | What it does | Status |
 |---|---|---|---|---|
-| **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent (`claude`, `rag`, `search`, `schedule`, ...) | Implemented (v0.3.1) |
+| **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent. Optional `start()` lifecycle hook lets a tool own background loops (the bundled `schedule` tool uses this for proactive triggers). | Implemented (v0.3.1; lifecycle v0.11.0) |
 | **Channel** | `channels/<name>/` | Many | Handles a transport (`telegram`, `whatsapp`, `email`, ...) | Implemented (v0.4.0) |
 | **Provider** | `providers/<name>/` | Exactly one | Implements the AI chat loop (`anthropic`, `openai`, ...) | Implemented (v0.4.0) |
 | **History store** | `history/<name>/` | Exactly one | Raw append-only message log (`jsonl`, `postgres`, ...) | Implemented (v0.5.0) |
 | **Memory** | `memory/<name>/` | Exactly one | Indexer + retriever over history (`naive`, `vector-rag`, `graphrag`, ...) | Implemented (v0.5.0) |
-| **Scheduler** | `scheduler/<name>/` | Zero or one | Stores schedule definitions + execution log; core tick fires due jobs (`jsonl`, `pg-boss`, ...) | Implemented (v0.7.0) |
 
 The asymmetry in "how many active" reflects real differences:
 - **Tools are capabilities** — a project can have several (coding, RAG, search, calendar, schedule)
@@ -58,7 +60,8 @@ The asymmetry in "how many active" reflects real differences:
 - **Providers are thinking layers** — a chat agent has one reasoning model per turn; multiplexing two providers within one conversation is confused, not a feature
 - **History is the source of truth** — one canonical log per install; multiple stores would split the truth
 - **Memory is a single lens** — the agent reasons from one context model at a time; two memories would disagree on what's relevant
-- **Scheduler is optional** — many projects never need proactive triggers. Zero is a valid state (no tick loop runs, the bundled `schedule` tool returns a clear error). One is enough — two would race on claim semantics and produce double-fires
+
+Proactive behavior (scheduled triggers, watchers, pollers) was a separate plugin type in v0.7.0 – v0.10.0 (`scheduler/<name>/`). v0.11.0 collapses it into the tool extensibility point via a lifecycle hook (`ToolPlugin.start`) — see [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook). The asymmetry "how many active" no longer needs a dedicated row: tools that need proactivity own their own loop, and tools that don't stay stateless.
 
 ## Core data model (v0.4.0)
 
@@ -475,75 +478,79 @@ Three design decisions worth calling out:
 - **Query for relevance ranking**: `recall(contactId, query)` passes the plain latest user text. RAG plugins use it; naive memory ignores it. Plugins should not assume `query` is the full turn context — it's just the trigger text.
 - **Not a cache**: memory is a retrieval system, not a cache of history. Two memory plugins can coexist during migration by running both and comparing, but only one is ever active in production (exactly-one rule).
 
-### DR-010: Scheduler is an optional pluggable proactive trigger source
+### DR-010: Proactive triggers live inside tool plugins via the lifecycle hook
 
-**What.** Schedules (time-based proactive triggers) are handled by an optional **scheduler plugin** under `.nanogent/scheduler/<name>/`. Zero or one scheduler is active per install — unlike history/memory, the runtime does not require a scheduler, and projects that don't need proactivity simply don't install one.
+**Status:** v0.11.0 reverses the v0.7.0 design. The original "scheduler is an optional pluggable plugin type" shape (DR-010, revision 0.3) shipped in v0.7.0 – v0.10.0. v0.11.0 collapses it into the tool extensibility point. This entry documents both the reversed decision and why.
 
-The scheduler plugin owns both schedule **definitions** (the rules the agent set up) and the **execution log** (what actually fired, when, with what status). The contract:
+**What.** Time-based proactive triggers are implemented inside whichever **tool plugin** wants them, via the optional `ToolPlugin.start(ctx)` lifecycle hook. The bundled `tools/schedule` plugin owns the full surface area: CRUD via `execute()` (reactive path the agent calls), a minute-resolution tick loop started from `start()` (proactive path fired by core), definitions in its own `state/schedules.json`, and an append-only execution log in its own `state/log.jsonl`. Core knows nothing about scheduling as a concept — it provides one primitive (`fireSystemTurn` on `ToolStartCtx`) and one lifecycle shape (`start()` may return a stop fn that core calls on shutdown).
 
 ```ts
-interface SchedulerPlugin {
-  init(ctx): Promise<void>;
+interface ToolPlugin {
+  // ...reactive methods (execute, etc.)
+  start?(ctx: ToolStartCtx): Promise<(() => void) | void>;
+}
 
-  // Definition CRUD — called by the agent-facing `schedule` tool
-  createSchedule(spec): Promise<Schedule>;
-  listSchedules(filter?): Promise<Schedule[]>;
-  getSchedule(id): Promise<Schedule | null>;
-  deleteSchedule(id): Promise<boolean>;
-
-  // Execution — called by the core tick loop (once a minute)
-  claimDue(now, limit?): Promise<ClaimedJob[]>;
-  markComplete(jobId): Promise<void>;
-  markFailed(jobId, error): Promise<void>;
-
-  // Introspection
-  listExecutions(filter?): Promise<ScheduleExecution[]>;
+interface ToolStartCtx {
+  projectName: string;
+  projectDir: string;
+  pluginDir: string;                    // state goes under pluginDir/state/
+  fireSystemTurn(opts: {                // inject a non-user turn into the queue
+    channel: string;
+    chatId: string;
+    contactId: string;
+    text: string;
+  }): void;
+  log(...args: unknown[]): void;
 }
 ```
 
-The bundled default (`scheduler/jsonl`) stores definitions in `state/schedules.json` and execution state in `state/schedule-log.jsonl` (append-only). Alternative backends (sqlite, pg-boss, redis, cloud cron bridges) can swap in without changing core or the agent-facing tool.
+`fireSystemTurn` remains the single entry point for non-user-initiated turns (scheduled triggers, async job completions, future webhook/watcher/poller tools). It is **not exported** from `nanogent.ts` — plugins receive it through `ToolStartCtx`. Core builds a synthetic trigger and injects it into the existing turn queue with `isSystemTrigger: true`, so the turn goes through the same memory recall → tool loop → channel send pipeline as any other turn.
 
-Core owns three small pieces of plumbing that go with the plugin:
+**What v0.7.0 – v0.10.0 did (reversed):** a dedicated `scheduler/<name>/` plugin type with a nine-method `SchedulerPlugin` contract (`init`, `createSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule`, `claimDue`, `markComplete`, `markFailed`, `listExecutions`), a core-owned tick loop that called `scheduler.claimDue`, and a `ToolCtx.scheduler` handle the bundled `schedule` tool used to reach the active plugin. All four of those — the plugin type, the nine-method contract, the core tick loop, and the tool-ctx handle — are gone.
 
-1. A **`fireSystemTurn(channel, chatId, contactId, text)` helper** — the single entry point for turns that weren't initiated by a user message. It builds a synthetic trigger and injects it into the existing turn queue with `isSystemTrigger: true`, so the turn goes through the same memory recall → tool loop → channel send pipeline as any other turn. The scheduler tick loop uses it; the existing async-job completion path (pre-v0.7.0) already does the equivalent inline, and future event sources (webhooks, tool completion callbacks) should route through the same helper.
+**Why the reversal.**
 
-2. A **scheduler tick loop** — `setInterval(60_000)` that calls `scheduler.claimDue(new Date(), 10)`, fans each returned job into `fireSystemTurn`, then calls `markComplete` (or `markFailed` if enqueueing threw). The loop is started only if a scheduler plugin is loaded; it is a no-op otherwise. One tick fires immediately on boot so schedules that came due while the process was down get picked up right away (subject to the plugin's own missed-fire policy).
+- **The split made plugin dependency management confusing.** With two plugins (`scheduler` + `tools/schedule`) that only worked together, operators could install one without the other and get silent half-functionality: a scheduler plugin with no agent-facing tool to CRUD its definitions, or a schedule tool returning "no scheduler installed" errors on every call. The default profile shipped both, which papered over the problem for the happy path but left the contract ambiguous. Consolidation eliminates the mismatch.
 
-3. A **`scheduler` field on `ToolCtx`** — so the bundled `schedule` tool (and any future scheduling-aware tool) can reach the active plugin via `ctx.scheduler`. Null if no scheduler is installed.
+- **The nine-method `SchedulerPlugin` contract was leaking implementation detail through the type system.** Core didn't need any of the CRUD methods — only the `schedule` tool called them. Core's only interest was `claimDue` / `markComplete` / `markFailed`, which is really "call my tick callback" wearing a costume. Once you see that core's surface area is one primitive (`fireSystemTurn`) and one callback (`start()` returning a stop fn), the whole nine-method interface was scaffolding for a relationship that didn't exist.
 
-**Why.**
+- **Lifecycle is the correct primitive for *any* proactive tool, not just scheduling.** Future tools that want to watch a webhook endpoint, poll an inbox, tail a log file, or listen for file-system events need exactly the same seam: "run my loop in the background, call `fireSystemTurn` when I have something to say, stop cleanly on shutdown." The lifecycle hook covers all of them. A typed `SchedulerPlugin` seam would have forced each of those to either invent its own plugin type or squat on `scheduler` as a misnomer. DR-014 formalises this: core provides primitives, plugins own implementation details, including their own lifecycle.
 
-- **Proactivity is real demand, plugin shape is speculative.** Many nanogent deployments want "run this at 8am" — that's a concrete use case. But "how should the schedule queue work" has genuine implementation variance: in-process jsonl, sqlite, durable queues like pg-boss, external cron bridges. Hardcoding one choice would either ship over-engineered defaults or box in users who need durability guarantees. A plugin seam lets the default be as simple as jsonl while leaving the door open for substitution. Designing the contract from core's actual call sites (CRUD + claim/complete/fail) kept the interface to ten methods — small enough to be worth having, large enough to be meaningful.
+- **Plugin-owned state is cleaner than a shared `state/` dir.** In v0.7.0 the jsonl scheduler wrote `state/schedules.json` and `state/schedule-log.jsonl` directly under the core `state/` dir, forcing a "plugin namespaces itself by filename prefix" convention. In v0.11.0 each plugin writes under its own `pluginDir/state/`, matching the convention `tools/claude` already used since v0.8.0. Core never reaches into plugin folders; plugins never reach into `core state/`. See [DR-014](#dr-014-minimal-coreplugin-coupling).
 
-- **Definitions and execution state are tightly coupled.** Unlike history/memory (where memory is a *derived projection* that can legitimately be swapped independently), a scheduler's rules and its execution log always ship together: a sqlite scheduler wants both in the same db file, a redis scheduler wants both in the same keyspace, and swapping one without the other would leave orphan claims or unresolvable references. So scheduler is **one plugin**, not two (`schedule-store` + `schedule-queue`) — splitting them would be speculative pluggability nobody would use.
+- **`claimDue` atomicity, orphan recovery, missed-fire policy, retry policy** — all of these were plugin concerns under the v0.7.0 contract, and they stay plugin concerns under v0.11.0. The only difference is that they now live inside a tool module rather than a `SchedulerPlugin` module. The bundled `tools/schedule` preserves the same semantics: atomic claim via an append-only `claimed` log entry, orphan recovery on boot via fail-forward, no retries, one catch-up tick on boot for missed fires.
 
-- **The definitions file is a clean source of truth; per-fire state is append-only.** Inside the default jsonl plugin, `state/schedules.json` holds only the rules (what the agent CRUDs), and `state/schedule-log.jsonl` holds every fire attempt (claimed / completed / failed). This mirrors the event-sourcing shape already used for history/memory: the definitions file changes only on explicit CRUD, the log grows monotonically as schedules fire. Retry policy, last-fired tracking, and execution history all derive from the log without mutating the rules file.
+**Why the v0.7.0 shape existed in the first place.**
 
-- **Zero is a valid state.** Requiring a scheduler would force every nanogent install to ship one — wasted bytes for projects that never use proactivity. Making it optional lets operators opt in by dropping `scheduler/jsonl/` into `.nanogent/` (which `nanogent init` does by default, but `nanogent update` respects the user's choice if they remove it).
-
-- **Agent-initiated, not config-file-initiated.** Schedules are conversational: "remind me every morning at 8". That implies the agent creates them through a tool call rather than the operator editing config files from a terminal. Schedule state therefore lives under `state/` (mutable runtime state the agent owns), not `config.json` (operator-owned). This matches how history files are handled — same category of data.
-
-- **The scheduler plugin is NOT the right primitive for user-initiated turns or async tool dispatch.** Both tempting unifications are wrong. Routing user messages through the scheduler queue would add latency to the conversational hot path for no benefit. Routing async tool jobs through the scheduler would conflate "this turn has background work" (a per-turn concern with ephemeral semantics) with "this schedule needs to fire later" (a persistent, restart-safe concern). The shared primitive is `fireSystemTurn`, not the scheduler — schedules, async tool completions, and future webhook events all *use* `fireSystemTurn` to inject a turn, but they don't share state, lifecycle, or retry semantics.
+The v0.7.0 reasoning still holds for the *problem* (proactivity is a real capability, implementation variance across backends is genuine, definitions and execution state are tightly coupled, zero is a valid state). It was wrong about the *solution*: a dedicated plugin type was over-structured for a capability that only had one call site into core. The insight from v0.11.0 is that "implementation variance across backends" doesn't require a typed seam — it just requires that alternate backends implement the same `ToolPlugin` shape, which they already have to do. Swapping `tools/schedule` for `tools/schedule-redis` or `tools/schedule-postgres` is the same operation as swapping `tools/claude` for `tools/opencode`: install a different tool plugin.
 
 **Consequences.**
 
-- **`claimDue` atomicity is the one semantically loaded operation.** The contract promise is: "a claimed job will not be returned by a second `claimDue` call until `markComplete` or `markFailed` runs." The jsonl default achieves this via a `claimed` log entry; a SQL backend would use `SELECT ... FOR UPDATE SKIP LOCKED`; a redis backend would use `BRPOPLPUSH`. Core doesn't care how — it just calls the method.
+- **`tools/schedule/state/` is plugin-owned.** Definitions (`schedules.json`) and the append-only execution log (`log.jsonl`) both live under the plugin's own dir. The plugin's own `gitignore` file lists `state/` so operator repos don't pick it up.
 
-- **Orphan claim recovery is the plugin's responsibility.** If a previous process crashed between `claimed` and `markComplete`, the scheduleId could stay in "in-flight" forever. The jsonl default handles this on `init()` by scanning the log for orphan claims and fail-forwarding them with `error: orphan-crash-recovery`. Alternative backends must implement equivalent logic — the core doesn't retry, re-claim, or replay on its behalf.
+- **Orphan claim recovery, retry policy, missed-fire policy are still plugin-scoped.** The bundled `tools/schedule` preserves the v0.7.0 semantics: on `start()` it reads its log, fail-forwards any orphan `claimed` entries with `error: orphan-crash-recovery`, fires one immediate tick for missed-fire catch-up, then starts a 60-second interval tick. Alternative schedule-tool implementations are free to pick different policies, but they own them end to end.
 
-- **Retry policy is plugin-scoped, not core-scoped.** Core does not retry failed fires. If a scheduler plugin wants retries (e.g., "if a turn fails, re-queue with exponential backoff"), it does so internally — its `markFailed` implementation can append a new due-at record and `claimDue` will pick it up on the next tick. The default jsonl plugin does **not** implement retries: a failed fire is recorded as `failed` and the schedule becomes eligible again on its next computed time. This is intentional — retrying a scheduled agent turn is semantically ambiguous (does the agent want to see "I'm retrying because the last run failed" in history, or should it be invisible?), and cheap to add per-backend when a real requirement appears.
+- **`fireSystemTurn` is a primitive, not an export.** Plugins reach it through `ToolStartCtx`, not by importing from `nanogent.ts`. Core exports nothing to plugins except types. See DR-014.
 
-- **Missed-fire policy is plugin-scoped.** If the process is down for two hours, a `daily@08:00` schedule that should have fired once during that window could be replayed on boot (once, to catch up) or silently dropped (treat the window as lost). The jsonl default fires it once on boot tick because computeNextFire returns a past time — which the tick loop treats as due. A durable backend might implement exactly-once semantics or sliding windows. Plugin authors should document their choice.
+- **`[SCHEDULED "<name>"] <prompt>` prefix is a `tools/schedule` convention, not a core convention.** The bundled plugin emits this prefix so the agent can recognise scheduled triggers. Alternative schedule tools are free to invent their own framing — the agent-side prompt engineering will just need to match.
 
-- **`fireSystemTurn` is the only new core export.** Everything else the scheduler plugin needs already exists: the turn queue, `processTrigger`'s `isSystemTrigger` branch that recomputes effective tools for non-user triggers, the channel send pipeline. The scheduler is a small addition precisely because the runtime already had the shape it needed.
+- **Zero proactive tools is a valid state.** Operators who don't want scheduling can remove `tools/schedule/` from their profile — no tick loop runs, no state files are created, nothing else changes. The core tool lifecycle iterator just finds no tools with a `start()` hook and moves on.
 
-- **System prompt contextualization is the agent's responsibility.** When a scheduled turn fires, the trigger text is prefixed `[SCHEDULED "<name>"] <prompt>` so the agent can recognize it's responding to a scheduled event rather than a live user message. Plugin authors writing alternative schedulers should preserve this prefix pattern or document their own convention — the agent relies on it to adjust tone and phrasing.
+- **The seven plugin directories become five.** `scheduler/<name>/` is gone; `tools`, `channels`, `providers`, `history`, `memory` remain. The `PLUGIN_TYPES` constant in `bin/cli.ts` drops the `'scheduler'` entry. `template/scheduler/` is deleted. `template/profiles/default.json` drops the `../scheduler/jsonl` entry.
 
-- **`schedule` tool is bundled but inert without a scheduler.** The agent-facing `schedule` tool ships as a default in `tools/schedule/` because scheduling is a common-enough capability that making it a first-class default beats making users hunt for it. If no scheduler plugin is installed, every call to the tool returns a clear error pointing at `.nanogent/scheduler/`. This matches the pattern of installing capability-first and letting operators disable what they don't want.
+- **Time zones are still punted to the agent.** Unchanged from v0.7.0: the bundled schedule tool stores `daily@HH:MM` in UTC and expects the agent to convert from the user's local wall clock before calling `schedule_create`.
 
-- **Time zones are punted to the agent.** The default jsonl scheduler stores `daily@HH:MM` in UTC. The agent is responsible for converting the user's local wall clock to UTC before calling `schedule_create`. A richer `daily@HH:MM@<tz>` format is a future extension that plugin authors can add independently.
+- **Per-contact execution serialization is unchanged.** The existing global `turnQueue` still serializes all turns (user + system + scheduled), so scheduler fires cannot race with live user messages or async job completions.
 
-- **Per-contact execution serialization is unchanged.** The existing global `turnQueue` already serializes all turns (user + system + scheduled) across the entire process, so scheduler fires cannot race with live user messages or async job completions. A future per-contact serializer (allowing cross-contact parallelism) would not change the scheduler — it still just enqueues via `fireSystemTurn`.
+**Checklist for writing a proactive tool plugin (schedule, webhooks, watchers, pollers):**
+
+- [ ] Implement `ToolPlugin.start(ctx: ToolStartCtx): Promise<() => void>` — return a stop fn that tears down every timer, listener, or subscription you opened.
+- [ ] Keep all state under `ctx.pluginDir + '/state/'`. Add `state/` to your plugin's `gitignore` file.
+- [ ] Use `ctx.fireSystemTurn({ channel, chatId, contactId, text })` to inject non-user turns. Do not import from `nanogent.ts` — core does not export `fireSystemTurn` to plugins.
+- [ ] `start()` failures are logged and swallowed by core. Don't rely on them to block boot — catch and log internally so partial state is cleaned up if one side of your init fails.
+- [ ] Do not hand out your internal state to other plugins via module-level globals. If a second plugin needs to see your state, expose it through a tool call (the way `tools/schedule` exposes schedule listings via `action: list`), not through a shared import.
+- [ ] Document your trigger prefix convention (if any) in your plugin's README so agent prompts can recognise your triggers.
+- [ ] If you need CRUD surface for the agent, colocate it in the same plugin's `execute()` — do not split it into a separate tool plugin that depends on yours. See DR-010's reversal rationale: split-plugin dependencies introduce silent half-functionality.
 
 ---
 
@@ -614,24 +621,15 @@ Read [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-his
 - [ ] Log errors but don't throw — the core treats memory failures as recoverable (index can always be rebuilt from history)
 - [ ] Keep plugin-local state under `<plugin-dir>/state/` and namespace by `contactId`
 
-### Writing a scheduler plugin (v0.7.0+)
+### Writing a proactive tool plugin (v0.11.0+)
 
-Read [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source) first.
+Read [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook) and [DR-014](#dr-014-minimal-coreplugin-coupling) first. The bundled `tools/schedule` is the reference implementation — read its source before inventing your own loop shape.
 
-**Checklist:**
+See DR-010's "Checklist for writing a proactive tool plugin" for the operational rules. Short version: implement `ToolPlugin.start(ctx)`, keep state under `ctx.pluginDir + '/state/'`, use `ctx.fireSystemTurn` to inject non-user turns, return a stop fn from `start()` for clean shutdown.
 
-- [ ] Implement the full `SchedulerPlugin` contract: `init`, `createSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule`, `claimDue`, `markComplete`, `markFailed`, `listExecutions`
-- [ ] Honour the `claimDue` atomicity promise: a claimed job must not be returned by a second `claimDue` call until `markComplete` or `markFailed` has run. For jsonl, this means writing a `claimed` log entry synchronously before returning. For SQL, this means `SELECT ... FOR UPDATE SKIP LOCKED` or equivalent. For redis, `BRPOPLPUSH` or equivalent.
-- [ ] Keep the definitions file (or equivalent table) and the execution log separate concerns in your backend. Definitions change only on CRUD; the log grows monotonically. Do not mutate an existing execution record to reflect a status change — append a new one. This matches event-sourcing semantics and makes restart recovery trivial.
-- [ ] Implement orphan claim recovery on `init`. Scan your in-flight state for `claimed` records with no matching `completed`/`failed` and decide (a) fail-forward them with a descriptive error, or (b) re-issue them on the next `claimDue`. The default jsonl plugin fails them forward — document whichever choice you make.
-- [ ] Document your schedule string format in your plugin's README. The bundled jsonl default supports `once@<ISO-UTC>`, `daily@HH:MM`, `every@<seconds>`. You are free to invent your own — cron expressions, natural-language intervals, calendar integrations — as long as the agent can generate valid strings from its system prompt or the tool description teaches the format.
-- [ ] Reject invalid schedule strings eagerly in `createSchedule` (throw, don't silently store). A schedule that never fires because the format was wrong is a very frustrating failure mode to debug.
-- [ ] `getSchedule`, `listSchedules`, `listExecutions` are read-only — do not mutate state in them.
-- [ ] If you implement retries, implement them inside the plugin (e.g., `markFailed` re-enqueues the schedule with a delayed next-fire). Core does not retry. Document your retry policy in the README.
-- [ ] Document your missed-fire policy: when the process was down through a scheduled time, do you fire once on boot (catch-up), drop silently, or replay every missed instance in order? The jsonl default fires once on boot.
-- [ ] Keep plugin state under `ctx.stateDir` and do not hardcode paths outside it. The core's `/state/` gitignore covers this dir by default.
-- [ ] Treat `contactId`, `channel`, and `chatId` on `ScheduleSpec` as opaque strings — they're routing metadata, not schedule identity. Do not parse them.
-- [ ] Log failures but don't throw out of methods that the core calls in a tight loop (`claimDue` especially). A scheduler plugin that throws every tick will just spam logs; one that logs and returns an empty result degrades gracefully.
+### Updating plugin state location for history and memory (v0.11.0 migration)
+
+If you're writing a history store or memory plugin, note that `HistoryStoreCtx` and `MemoryCtx` no longer expose a `stateDir` field. v0.11.0 aligned these two plugin types with the DR-014 principle: plugins own their state location, so state goes under `ctx.pluginDir + '/state/'`, same as tools. Add a `gitignore` file to your plugin (listed in `plugin.json.files`) that lists `state/`.
 
 ### DR-011: Plugins inject container dependencies via `install.sh`
 
@@ -669,7 +667,7 @@ This problem generalises beyond `tools/claude`. Different coding harnesses need 
 - **Plugin install.sh runs as root during `docker compose build`.** This is a meaningful trust surface — installing an untrusted plugin means running its `install.sh` as root inside your build context. Plugin authors should keep install scripts minimal and auditable. Operators should treat third-party plugin installs with the same caution they'd apply to any `curl | bash` — because that's what it is.
 - **A new manual step exists: `nanogent build` after adding/removing/editing plugin `install.sh` files.** `nanogent start` only auto-runs build when the generated file is *missing*, not when it's stale. Running build manually after plugin changes is the contract; stale-detection (hashing plugin contents) would add complexity for marginal benefit.
 - **Trust asymmetry with pure runtime plugins.** Before v0.8.0, a tool plugin could only execute code inside `runTurn` (sandboxed by the tool invocation lifecycle and the permission model). A plugin with an `install.sh` executes code during image build *before* any permission check. Nothing in core mitigates this — it's inherent to the "let plugins modify the image" goal.
-- **Build output is not a new plugin type.** It's a convention applied to existing plugin types. The six plugin-type extensibility points (tool, channel, provider, history, memory, scheduler) stay at six. Every plugin can opt in via `install.sh`; none have to.
+- **Build output is not a new plugin type.** It's a convention applied to existing plugin types. Every plugin can opt in via `install.sh`; none have to. (As of v0.11.0 the plugin-type extensibility points are five — tool, channel, provider, history, memory — after the scheduler type was collapsed into the tool lifecycle seam. See [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook).)
 - **The base Dockerfile is still customisable.** Operators who need a different FROM image, extra baseline apt packages, locale settings, or non-root users edit `.nanogent/Dockerfile` (which is `type: code` in the update manifest, so it's overwritten on update — re-apply local changes after `nanogent update`). The marker line must stay intact.
 - **Resource requirements are surfaced as an advisory, not edited into compose.** `install.sh` only controls what's *installed* in the image; the actual `mem_limit` / `cpus` / GPU passthrough in `docker-compose.yml` stays operator-owned. As a v0.8.1 follow-up, plugins may optionally ship a `resources.json` next to `install.sh` declaring `minMemoryMb` / `minCpus` / `note`. `nanogent build` aggregates these across all plugins via `max()` (plugins share one container, so the floor is the hungriest plugin's floor — not the sum) and prints one advisory block at the end of the build, including which plugin set each max and whether `docker-compose.yml` already declares any resource limits. Missing, malformed, or partial `resources.json` files are fine: discovery warns and skips, and the build never fails on an advisory file. GPU passthrough remains out of scope — `resources.json` is advisory-only, no compose mutation, so it has nothing to declare about `device_requests` beyond a free-text `note`.
 
@@ -681,7 +679,7 @@ This problem generalises beyond `tools/claude`. Different coding harnesses need 
 - [ ] Prefer idempotent steps (`apt-get install -y` is already idempotent; guard vendor installers with `command -v X >/dev/null || ...` where possible)
 - [ ] Do not rely on `.nanogent/` being present inside the image — the install script runs in a bare build context with only the script itself copied in. Any runtime files your plugin needs live under its plugin folder and are visible at runtime, not install time.
 - [ ] Pin versions when stability matters (`npm install -g pkg@1.2.3`), accept latest only when the plugin author is willing to own the churn
-- [ ] Do not write to plugin folders from `install.sh` — those files don't persist past the RUN layer, and state should live under `ctx.stateDir` at runtime anyway
+- [ ] Do not write to plugin folders from `install.sh` — those files don't persist past the RUN layer, and state should live under `ctx.pluginDir + '/state/'` at runtime anyway (per DR-014)
 - [ ] Document what gets installed in the plugin's README so operators know what they're opting into
 - [ ] Leave executable bit set (`chmod +x install.sh`) before committing; npm pack strips it, so the CLI re-chmods on init, but git needs it
 - [ ] Run `nanogent build` yourself and confirm the generated COPY + RUN lines look right before pushing a plugin update
@@ -813,6 +811,191 @@ At runtime, the code was already OCP-clean: `template/nanogent.ts` walks `.nanog
 - [ ] New profile refs must be relative paths from the profile file's directory (not `process.cwd()`-relative).
 - [ ] Anything that adds a new filename convention (like `gitignore` → `.gitignore`) must be documented in this DR's plugin-author checklist and applied symmetrically in both `installPlugin` and `composeUpdateEntries`.
 
+### DR-014: Minimal core↔plugin coupling
+
+**Status:** Accepted (v0.11.0). Ratifies a direction the codebase was already drifting in (`tools/claude/state/` since v0.8.0) and applies it uniformly.
+
+**Principle:** Core provides primitives. Plugins own implementation details. The coupling surface in each direction is a tiny, fixed contract — and nothing more.
+
+**Context:** By v0.10.0 nanogent had accumulated several places where core reached further into plugin implementation than it should have. The typed `SchedulerPlugin` seam (nine methods, most of them useful only to the `schedule` tool that called them) was the worst offender, but the pattern also showed up in subtler ways: `HistoryStoreCtx` and `MemoryCtx` handed plugins a `stateDir` field pointing at a shared `.nanogent/state/` tree with a "plugin should namespace under its own subdir" comment, implicitly pretending core could reason about a shared state namespace without actually owning the shape of what went into it. Core validated specific plugin method names at load time (`typeof scheduler.claimDue !== 'function'`) — harmless in isolation but a signal that core knew too much about what a plugin was.
+
+None of this was load-bearing in the "without this, the runtime breaks" sense. It was all *accumulated coupling debt*: small decisions where, when in doubt, core knew one more thing about plugins than it strictly needed to. DR-014 names the principle that should have guided those decisions, so future extension work starts from it instead of accumulating the same debt.
+
+**Decision:** Make the coupling surface between core and plugins explicitly minimal. Core provides a small, fixed set of primitives via ctx objects, and a small, fixed set of lifecycle hooks it will call. Everything else — state location, state format, state migration, background loop management, file layout, update-time preservation semantics — is the plugin's concern, invisible to core.
+
+**What core owns:**
+
+- **Plugin discovery.** Walk `PLUGIN_ROOTS`, find every directory containing a valid `plugin.json`, import its `index.ts`.
+- **Lifecycle orchestration.** Call `init()` / `start()` in a known order at boot; call the returned stop fn in reverse order at shutdown. Wrap each call in try/catch so a buggy plugin never blocks boot.
+- **Shared primitives handed to plugins via ctx objects.** `fireSystemTurn` (inject a non-user turn), `log` (namespaced logger), the existing per-tool channel-send handles on `ToolCtx`, `newJobId` / `backgroundJob` / `busy` for long-running tools. These are *named operations*, not a reflection system or an event bus.
+- **Contract type checks.** Verify the loaded module exports the required methods; if not, log and skip that plugin with a clear error. Core never calls a method that isn't part of the published contract.
+
+**What plugins own:**
+
+- **State location.** Core hands `pluginDir`; plugin decides what subtree (e.g. `pluginDir/state/`) and what files to create.
+- **State shape and format.** JSON, JSONL, SQLite, binary — core never looks inside.
+- **State migration across plugin versions.** When a plugin's storage schema changes between revisions, the plugin handles its own migration inside `init()` / `start()`. Core does not know a schema exists, so it cannot assist; asking core to assist would recreate the coupling the DR is trying to eliminate.
+- **Install-time side effects.** Container dependencies via `install.sh` (DR-011). Build-time scripts run as root but the *decision* of what to install lives entirely in the plugin.
+- **Resource advisories.** Optional `resources.json` (DR-011). One tolerated exception to "core never parses plugin-owned data files" — the advisory is opt-in, advisory-only, and never load-bearing. Core reads it only to print a build-time hint.
+- **Lifecycle internals.** A plugin's `start()` can spawn timers, workers, file watchers, webhook listeners, whatever — core doesn't care what happens inside, only that the returned stop fn tears it all down cleanly.
+- **The plugin's entire file layout under its directory.** Tools ship `index.ts` + `plugin.json` + optional `README.md` + optional `install.sh` + optional `gitignore` + optional `state/` subdir. Future plugins can ship whatever they need. The only files core ever touches are the ones listed in the plugin's own `plugin.json.files`.
+
+**The coupling surface — deliberately tiny:**
+
+*Plugin → core:* a default export matching one of five typed interfaces (`ToolPlugin`, `ChannelPlugin`, `ProviderPlugin`, `HistoryStorePlugin`, `MemoryPlugin`) with a fixed small set of methods. No reflection, no event bus, no dynamic registration. Adding a method to a plugin interface is a type-level change that propagates through every implementation the same way.
+
+*Core → plugin:* one ctx object per lifecycle call (`ToolStartCtx`, `ChannelCtx`, `HistoryStoreCtx`, `MemoryCtx`), containing a fixed small set of data fields and primitive functions. Plugins use only the ctx fields they need. Core never injects a field "in case future plugins want it."
+
+**What this rules out:**
+
+- Core reading or writing inside plugin folders beyond the MANIFEST-driven init/update copy.
+- Core parsing plugin-owned data files (the `resources.json` advisory is the one tolerated exception — opt-in, advisory-only, never load-bearing).
+- Core dictating state location, format, or migration strategy.
+- "Well-known paths" under a shared `.nanogent/state/<convention>/` tree where multiple plugins implicitly share a namespace.
+- Module-level exports from `nanogent.ts` intended to be imported by plugins. The `fireSystemTurn` primitive was previously exported for this reason; v0.11.0 un-exports it and hands it through `ToolStartCtx` instead.
+
+**Consequences.**
+
+- **`ToolPlugin` gains a lifecycle hook.** `start?(ctx: ToolStartCtx)` is optional. Tools that don't need it (claude, search, rag) don't implement it and pay no cost. Tools that do (schedule, future webhook listeners, future pollers) own their loop internally and return a stop fn. Core's tool boot loop iterates every tool, calls `start()` if present, wraps in try/catch, collects stop fns, tears them down on shutdown in reverse order.
+
+- **`HistoryStoreCtx` and `MemoryCtx` drop `stateDir`.** `pluginDir` stays; `stateDir` is gone. Both ctxs now pass the same symmetric "here's your folder, do what you like" pattern. The bundled `history/jsonl` plugin now writes under `pluginDir/state/` (previously `stateDir/history/`). `memory/naive` didn't use `stateDir` at all (it derives everything from history), so its migration is a no-op.
+
+- **The nine-method `SchedulerPlugin` type is deleted.** Its CRUD surface was a relationship between the tool and the backend, not between core and the backend. Collapsing both into one `ToolPlugin` (the bundled `tools/schedule`) eliminates the type entirely. See [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook) for the reversal.
+
+- **`fireSystemTurn` is un-exported.** Plugins receive it through `ToolStartCtx.fireSystemTurn`. The old `export function fireSystemTurn(...)` is gone. This prevents future plugins from reaching into core by import path and keeps the coupling surface inside the ctx objects where it's visible.
+
+- **A buggy `start()` logs and continues.** Core wraps each `start()` in try/catch. A plugin whose initialization crashes is logged as `tool <name> start() failed — <message>` and skipped; the rest of boot proceeds. Operators see the error and can remove or fix the plugin. The alternative (let one plugin's bug crash the agent) is strictly worse.
+
+- **Symmetrical with `ChannelPlugin.start` that already exists.** Channel plugins have returned an optional stop fn from their `start(ctx)` method since v0.4.0. Tool lifecycle mirrors the same pattern: same return shape, same stop semantics, wrapped in the same try/catch. Future plugin types that need lifecycle can copy the shape without inventing new conventions.
+
+- **`core state/` is smaller.** After history moves out, `.nanogent/state/` contains only `jobs.json` (the core job registry) and `learnings.md` (the core learn tool). Every other piece of runtime data lives under its owning plugin's directory. The top-level `.nanogent/.gitignore` still covers `state/` for the core files.
+
+- **History/memory plugin authors update their init.** The migration from `ctx.stateDir` to `ctx.pluginDir + '/state/'` is a one-line change per plugin plus adding a `gitignore` file. The plugin-author guidance sections have been updated in-place.
+
+- **No further ctx injection without justification.** Adding a new field to any plugin ctx object should be treated as a capability expansion that affects every plugin of that type. The bar is: "can I name a primitive that isn't representable by combining existing fields?" If not, the field doesn't belong in ctx. This is the rule that prevents ctx objects from accumulating "nice to have" properties over time.
+
+- **Future plugin types inherit the principle.** When a new plugin type is added (a hypothetical `observability` or `audit` plugin), its ctx object starts from the same minimal baseline — `projectName`, `projectDir`, `pluginDir`, `log`, plus only those primitives whose job it is to hand the plugin *something it cannot produce itself*.
+
+**Checklist for contributors extending core:**
+
+- [ ] Before adding a field to any plugin ctx object, justify it against "is this a primitive the plugin cannot produce itself?" Configuration knobs, convenience handles, pre-computed derived state — none of these belong in ctx.
+- [ ] Before adding a method to any plugin interface, check whether core actually calls it. If the only caller is another plugin, the method belongs on the caller plugin's internal surface (accessed via its own `execute()` or its own state), not on the shared interface.
+- [ ] Before exporting a helper from `nanogent.ts` to be imported by plugins, check whether the ctx pattern can cover it. Default to ctx injection; reserve module exports for shared *types* (which are compile-time only and carry no runtime coupling).
+- [ ] When a plugin needs state, it owns the location under `pluginDir`. Do not introduce new paths under the top-level `.nanogent/state/` tree — that dir is for core runtime state only.
+- [ ] When a new lifecycle hook is needed, copy the shape of the existing `ChannelPlugin.start` / `ToolPlugin.start` pair: async, may return a stop fn, wrapped in try/catch, torn down in reverse at shutdown.
+
+### DR-015: Portable state via per-type data contracts
+
+**Status:** Proposed (v0.11.0 lands the principle in DESIGN.md; code implementation is deferred to v0.12.0). The principle influences v0.11.0 data-layout decisions (keep schedule definitions and execution log in separate files — portable vs non-portable — even though no export/import code ships yet).
+
+**Principle:** Each plugin type that holds state defines a small, canonical data envelope. Plugins of the same type can migrate data between themselves via this envelope. Core orchestrates the hand-off but never looks inside.
+
+**Context:** [DR-014](#dr-014-minimal-coreplugin-coupling) establishes that plugins own their state end to end. A direct consequence: swapping one plugin implementation for another (e.g., `history/jsonl` → `history/sqlite`) is a data migration problem that core cannot solve, because core doesn't know what's in the files. But the plugins *can* solve it if they share a canonical envelope for export/import at the type level.
+
+Without this DR, "swap your history backend" silently means "abandon your old conversations." That's a bad story for any operator who wants to move from the default `jsonl` to a durable SQL-backed store once their install grows past the point where jsonl files are practical.
+
+**Decision:** Each plugin type that holds state (history, and the proactive tools that hold state like `tools/schedule`) declares a canonical `Portable<T>` interface for export/import. Plugins of that type implement it. Operators drive plugin-to-plugin migration through a future `nanogent plugin migrate <type> <from> <to>` CLI verb that pipes `old.export()` → `new.import(data)`. Core orchestrates the hand-off without parsing the envelope.
+
+**What the contract looks like:**
+
+```ts
+// Shared capability interface — one definition, reused per type.
+interface Portable<TExport> {
+  export(): Promise<TExport>;
+  import(data: TExport): Promise<void>;
+}
+
+// Per-type envelope — defined in types.d.ts alongside the plugin interface.
+interface HistoryExport {
+  version: 1;
+  messages: Record<string, HistoryMessage[]>;  // contactId → messages
+}
+
+// Plugin interfaces extend Portable<T> when portability is part of the contract.
+interface HistoryStorePlugin extends Portable<HistoryExport> {
+  // ...existing ops
+}
+```
+
+Methods on `Portable<T>` are **required**, not optional. If a plugin type declares portability, every implementation of that type must implement it. A plugin that can't support export/import shouldn't claim to be that plugin type — it should pick a different contract or return a clear "not supported" error inside `export()`. This pushes the "optional capability" question to the plugin type level, where it belongs.
+
+**Per-type portability stories (they're not all the same):**
+
+1. **History** — source of truth. Needs full `export`/`import`. Envelope is trivially `{ version, messages: contactId → messages[] }`.
+
+2. **Memory** — derived view on history. Does NOT need `export`/`import`. The swap story is "reindex from the history store": the new plugin's `init()` walks history via the existing `ctx.history` handle and rebuilds its index. This is already possible under the current contract; v0.12.0 will make "initial backfill on empty index" an explicit convention in the memory plugin-author checklist.
+
+3. **Proactive tools that hold state (`tools/schedule` today)** — source of truth for *definitions*, plugin-internal for *execution log*. `export`/`import` covers definitions only. Execution log is deliberately non-portable — it's implementation telemetry, not data the operator cares about preserving across a swap. This is why `tools/schedule` keeps definitions (`schedules.json`) and the log (`log.jsonl`) in separate files, so a future `export()` can dump one and ignore the other.
+
+4. **Tools in general** — stateless, no contract needed. Only tools that hold state declare portability. A `tools/webhook-listener` might ship persistent subscription state; a `tools/search` wouldn't. Each tool opts in as its own state demands.
+
+**The migration flow (v0.12.0):**
+
+```
+nanogent plugin migrate history jsonl sqlite
+```
+
+Core does: load old plugin → `old.export()` → load new plugin → validate envelope version → `new.import(data)` → swap active plugin reference → operator removes old plugin folder. Core touches no files, parses no formats, understands no schemas. Pure plumbing.
+
+**Version skew:** the envelope carries a `version` field. The importer decides what to do: accept, migrate up, or reject with a clear error. Core's role is only to refuse the migrate command if versions are incompatible and no in-plugin migration path exists. Forward/backward compatibility is a plugin concern, where it belongs.
+
+**Export is also a backup primitive.** `nanogent plugin export history > backup.json` dumps to stdout → operator commits or archives the JSON → `nanogent plugin import history < backup.json` restores. Free side-effect of the contract.
+
+**Why a capability interface, not optional methods.**
+
+Two candidates were considered:
+
+1. Inline optional methods on each plugin interface: `export?()` / `import?()` on `HistoryStorePlugin`.
+2. A named capability interface: `interface Portable<T> { export(); import(); }` extended by plugin interfaces that declare portability.
+
+The named capability wins for four reasons:
+
+- **Documents intent at a glance.** `HistoryStorePlugin extends Portable<HistoryExport>` tells a reader that portability is part of this type's contract. Inline `export?` hides the capability in the middle of a longer interface.
+- **Runtime checks are real type guards.** `isPortable(plugin)` is a concrete check, not duck-typing two method names.
+- **Reusable across plugin types.** History, schedule-tool state, and any future stateful type extend the same `Portable<T>` shape. Each re-declaring optional methods would be duplicate work and duplicate drift risk.
+- **Breaking changes are cheaper to avoid now.** Lifting optional methods into an interface later is a breaking change for every plugin that implemented the old shape. A named interface locks the shape on day one.
+
+The weak objection (`Portable<T>` is "one more type to learn") is outweighed: it's a three-line interface and matches a pattern plugin authors already understand from other TypeScript ecosystems.
+
+**Why ship the principle in v0.11.0 even without code.**
+
+v0.11.0 reshapes several plugin types (history, memory, the new `tools/schedule`) and their on-disk layouts. Some decisions in that reshape are load-bearing for v0.12.0's implementation:
+
+- **Schedule definitions and execution log must stay in separate files.** If `tools/schedule` had merged them into one file, v0.12.0's `export()` would need to parse the combined format to split out the portable half. Keeping them separate now means `export()` is a trivial read of `schedules.json`.
+- **`pluginDir/state/` as the storage convention is compatible with future `export()`/`import()`.** The plugin reads its own adjacent state — no path injection from core.
+- **Plugin authors writing today's plugins should know the shape that future portability will take,** so they don't accidentally design themselves into a corner (e.g., encrypting every field in a way that makes export impossible).
+
+**Consequences (v0.11.0 scope — no code, just shape).**
+
+- **No `Portable<T>` type is added to `types.d.ts` yet.** It lands in v0.12.0 when implementation is wired up. DR-015 describes the shape in prose so authors know what to design toward.
+- **`HistoryStorePlugin`, `MemoryPlugin`, and `ToolPlugin` interfaces are unchanged** from the v0.11.0 refactor. They do not yet extend `Portable<T>`.
+- **`bin/cli.ts` does not gain `plugin migrate` / `plugin export` / `plugin import` subcommands yet.** Those land with v0.12.0.
+- **`tools/schedule` keeps definitions and log in separate files** (`schedules.json` + `log.jsonl`), deliberately, so v0.12.0's `export()` is a one-line `readFileSync(schedulesPath)`.
+- **Memory swap story will be "reindex from history," not "export/import the index."** v0.12.0 will document this in the memory plugin-author checklist.
+
+**Consequences (v0.12.0 scope — for future reference).**
+
+- **`export()` / `import()` become required methods on every history store implementation.** Any in-tree history plugin that fails to implement them is a bug, not a degraded capability.
+- **The envelope is versioned from day one.** Envelopes without a `version` field are rejected. v1 is the starting version.
+- **The migrate CLI is unidirectional per invocation.** `nanogent plugin migrate history jsonl sqlite` is a one-way hand-off. There is no "undo" — the old plugin's files stay on disk until the operator removes them manually, and the operator is expected to keep both plugins installed until they've verified the new one works.
+- **Operators are responsible for *which* data is in flight during migration.** Running `migrate` on a live agent is unsupported — stop the agent, migrate, start the agent. The contract does not include "drain the queue, pause writes, atomic cutover." Plugins that need live migration are welcome to implement it internally, but core will not provide primitives for it in v0.12.0.
+
+**Open extensions (deferred to specific future DRs when concrete needs land):**
+
+- **`onUpdate?(ctx)` hook** — called when the plugin's own files are about to be rewritten by `nanogent update` so the plugin can migrate its state across plugin-version bumps. Not the same thing as plugin-to-plugin export/import; this is within-plugin schema migration.
+- **Verified integrity on import** — content hashes on the envelope so the importer can detect corruption or tampering mid-pipe. Out of scope for v0.12.0.
+- **Streaming export for huge datasets** — v0.12.0 assumes the full envelope fits in memory. A sqlite history with 10M messages would argue for a streaming protocol. Revisit when anyone actually has that.
+
+**Checklist for plugin authors designing for future portability:**
+
+- [ ] Keep portable and non-portable state in separate files. If your plugin holds "the canonical data" and "implementation telemetry" (execution logs, internal indexes, cached derivations), split them now so a future `export()` can dump the portable half cleanly.
+- [ ] Store dates as ISO 8601 strings, not native Date objects. Envelopes cross process and language boundaries; string dates survive JSON serialization with no timezone drift.
+- [ ] Treat `contactId` as an opaque identifier in every envelope. Do not assume it's a username or a numeric ID. Migration between plugins must preserve contactIds byte-for-byte.
+- [ ] Version your plugin's internal schema from day one, even if v1 is the only version. Bumping later is a breaking change; introducing versioning later is a coordination nightmare.
+- [ ] When in doubt about whether to ship state inside the `export()` envelope or behind a re-derive-from-source pattern, ask: "is this data that the operator would mourn losing if they swapped plugins?" If yes, it's portable; if no, leave it out and let the new plugin recompute.
+
+---
+
 ### Email plugin — specific guidance
 
 See [DR-004](#dr-004-email-channel-should-use-per-thread-chatids-with-shared-history). Quick summary:
@@ -853,5 +1036,6 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 - **0.5 (2026-04-15)** — Reversed the DR-011 deferral on resource requirements: v0.8.1 adds an optional per-plugin `resources.json` next to `install.sh` declaring `minMemoryMb` / `minCpus` / `note`. `nanogent build` discovers these, aggregates with `max()` semantics (plugins share one container), and prints one advisory block per build naming the hungriest plugin and whether `docker-compose.yml` already declares resource limits. Pure advisory — no compose mutation, no build failure on missing/malformed files. Updated the DR-011 Consequences paragraph and plugin-author checklist to cover the new optional file.
 - **0.6 (2026-04-15)** — Added DR-012 (Docker is the only supported runtime). v0.9.0 removes the host-node path and the `--node`/`--docker` flags: `nanogent start` always runs `docker compose up --build`, the CLI fails fast if `docker` is missing from PATH, `config.json` no longer carries a `docker` field, and `types.d.ts` drops it from `Config`. Rationale: DR-011's `install.sh` contract is inherently container-shaped, so supporting a host runtime would force a dual-install contract that doubles plugin-author burden and splits the test matrix. Removed the "node-mode users unaffected" consequence from DR-011 and revised the auto-build trigger wording from `nanogent start --docker` to `nanogent start`.
 - **0.7 (2026-04-15)** — Added DR-013 (core and plugin installation are decoupled; plugins are self-describing, defaults are data). v0.10.0 shrinks `CORE_MANIFEST` to 9 non-pluggable files and moves the 7 default plugins out of `bin/cli.ts` and into a new `template/profiles/default.json` whose refs point at the vendored plugin dirs. Every plugin now ships a required `plugin.json` (name, type, optional description, optional files list); `readPluginManifest`, `resolvePlugin`, `loadProfile`, `installPlugin`, `listInstalledPlugins`, and `composeUpdateEntries` form a uniform plugin-lifecycle pipeline that third-party plugins and shipped defaults share. `nanogent init` runs in three phases (core copy → profile-driven plugin install → `runBuild` seed) and accepts `--profile <path>` for custom profiles. A new `nanogent plugin list/add/remove` subcommand exposes the lifecycle to operators. `runUpdate` composes entries from `CORE_MANIFEST` + installed-plugin discovery by default, preserving the existing code/plugin/config semantics. Deferred: git/npm plugin refs and a plugin lock file. `bin/cli.ts` no longer contains any plugin-name string literals.
+- **0.8 (2026-04-15)** — Added DR-014 (minimal core↔plugin coupling) and DR-015 (portable state via per-type data contracts). Rewrote DR-010 as a reversal of the v0.7.0 scheduler-plugin design: the typed `SchedulerPlugin` seam is gone, time-based proactive triggers now live inside `tools/schedule` via an optional `ToolPlugin.start(ctx)` lifecycle hook returning a stop fn, and the `ToolStartCtx` hands plugins `pluginDir` + a `fireSystemTurn` primitive. `fireSystemTurn` is un-exported from `nanogent.ts` — plugins reach it only through ctx. `HistoryStoreCtx` and `MemoryCtx` drop their `stateDir` field: plugins now write state under `pluginDir/state/`, matching the convention `tools/claude` already used since v0.8.0. The plugin-type table drops from six rows to five (`scheduler/<name>/` is gone; `tools`, `channels`, `providers`, `history`, `memory` remain). DR-015 ships as principle-only in v0.11.0 — the `Portable<T>` interface, `export`/`import` methods on history, and `nanogent plugin migrate` / `export` / `import` CLI verbs are deferred to v0.12.0 but the principle influences v0.11.0's data layout (schedule definitions and execution log stay in separate files so future `export()` can dump the portable half cleanly).
 
 When adding a new decision or updating an existing one, add a line here with the date and a one-sentence summary.

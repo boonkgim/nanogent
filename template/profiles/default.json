@@ -1,13 +1,12 @@
 {
   "name": "default",
-  "description": "Opinionated starter set: Telegram + Anthropic + JSONL history/scheduler + naive memory + Claude tool + schedule tool",
+  "description": "Opinionated starter set: Telegram + Anthropic + JSONL history + naive memory + Claude tool + schedule tool (proactive ticks self-contained in the schedule tool)",
   "plugins": [
     { "ref": "../tools/claude" },
     { "ref": "../tools/schedule" },
     { "ref": "../channels/telegram" },
     { "ref": "../providers/anthropic" },
     { "ref": "../history/jsonl" },
-    { "ref": "../memory/naive" },
-    { "ref": "../scheduler/jsonl" }
+    { "ref": "../memory/naive" }
   ]
 }

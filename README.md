@@ -158,18 +158,16 @@ your-project/
       jsonl/                  ← default history store (raw append-only log)
         index.ts
         README.md
+        state/                ← plugin-owned runtime data (gitignored)
     memory/
       naive/                  ← default memory plugin (recent-window retrieval)
         index.ts
         README.md
-    scheduler/
-      jsonl/                  ← default scheduler plugin (optional; time-based proactive triggers)
-        index.ts
-        README.md
     tools/
-      schedule/               ← agent-facing tool for managing schedules (inert without a scheduler)
+      schedule/               ← default schedule tool (reactive CRUD + proactive tick loop, self-contained)
         index.ts
         README.md
+        state/                ← plugin-owned runtime data: schedules.json + log.jsonl (gitignored)
 ```
 
 **Your project root is untouched** — nothing nanogent-related lives outside `.nanogent/`. Teams commit `.nanogent/` as a unit to share prompt, tools, and config; runtime state stays local.
@@ -641,6 +639,74 @@ For plugins that don't ship a renamed file (everything except `tools/claude` in 
 { "name": "telegram", "type": "channels", "description": "Telegram bot transport" }
 ```
 
+### Migrating from 0.10.0
+
+v0.11.0 **tightens core↔plugin coupling** and **collapses the scheduler plugin type** into the tool extensibility point. Two new principles land in DESIGN.md — [DR-014](./DESIGN.md#dr-014-minimal-coreplugin-coupling) (core provides primitives, plugins own implementation details) and [DR-015](./DESIGN.md#dr-015-portable-state-via-per-type-data-contracts) (per-plugin-type portable data envelopes, principle-only in v0.11.0, implementation deferred to v0.12.0) — and [DR-010](./DESIGN.md#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook) is rewritten as a reversal of the v0.7.0 scheduler-plugin design.
+
+What's new:
+
+- **The `scheduler/<name>/` plugin type is gone.** Time-based proactive triggers now live entirely inside `tools/schedule`, which owns CRUD (via `execute()`) and the minute-resolution tick loop (via a new `ToolPlugin.start(ctx)` lifecycle hook) in one self-contained plugin. The `schedule` tool's state — definitions (`schedules.json`) and the append-only execution log (`log.jsonl`) — lives under its own `.nanogent/tools/schedule/state/` subdir, gitignored via the plugin's own `gitignore` file.
+- **`ToolPlugin` gains an optional `start(ctx: ToolStartCtx)` lifecycle hook.** Tools that need background loops (timers, file watchers, webhook listeners, inbound pollers) own them in `start()` and return a stop fn for clean shutdown. Tools that don't need this ignore the hook and pay no cost. The `ToolStartCtx` hands plugins `pluginDir` and a `fireSystemTurn` primitive for injecting non-user turns; everything else stays inside the plugin. Symmetrical with the existing `ChannelPlugin.start` pattern.
+- **`fireSystemTurn` is no longer exported from `nanogent.ts`.** Plugins reach it through `ToolStartCtx.fireSystemTurn`, not by importing from core. Any plugin that was importing the old export (none ship in default) will need to move to the ctx pattern.
+- **`HistoryStoreCtx` and `MemoryCtx` drop their `stateDir` field.** History and memory plugins now write state under `ctx.pluginDir + '/state/'`, matching the convention `tools/claude` and `tools/schedule` already use. The bundled `history/jsonl` plugin was updated accordingly; its files now live under `.nanogent/history/jsonl/state/<contactId>.jsonl` instead of `.nanogent/state/history/<contactId>.jsonl`. The bundled `memory/naive` plugin didn't use `stateDir` at all (memory derives from history), so no code changes there.
+- **The `ToolCtx.scheduler` field is gone.** Nothing in the default plugin set referenced it except the old `tools/schedule`, which no longer needs it.
+- **`PLUGIN_TYPES` in `bin/cli.ts` drops `'scheduler'`.** `plugin.json` files that declare `type: "scheduler"` will be rejected at install time. The five remaining types are `tools`, `channels`, `providers`, `history`, `memory`.
+
+Breaking changes (pre-publish scope):
+
+1. **Conversation history file locations moved** from `.nanogent/state/history/*.jsonl` to `.nanogent/history/jsonl/state/*.jsonl`.
+2. **Schedule definitions + log moved** from `.nanogent/state/schedules.json` + `.nanogent/state/schedule-log.jsonl` to `.nanogent/tools/schedule/state/schedules.json` + `.nanogent/tools/schedule/state/log.jsonl`.
+3. **`.nanogent/scheduler/` is deleted.** Its jsonl default is absorbed into `tools/schedule`.
+
+Migration (cleanest path — nanogent isn't published to npm yet, so existing installs are small):
+
+```bash
+# 1. Stop the agent if it's running.
+docker compose -f .nanogent/docker-compose.yml down
+
+# 2. Re-run init against a clean .nanogent/ if you have no local edits.
+rm -rf .nanogent
+nanogent init
+nanogent start
+
+# Or, if you have local edits worth preserving:
+# - Save your conversation history before upgrading:
+mkdir -p /tmp/nanogent-backup
+cp -r .nanogent/state/history/ /tmp/nanogent-backup/history/ 2>/dev/null || true
+cp .nanogent/state/schedules.json /tmp/nanogent-backup/ 2>/dev/null || true
+cp .nanogent/state/schedule-log.jsonl /tmp/nanogent-backup/ 2>/dev/null || true
+
+# - Upgrade:
+rm -rf .nanogent/scheduler
+nanogent update
+# (nanogent update won't touch plugin state, but the old paths are now stale.)
+
+# - Restore state into the new locations:
+mkdir -p .nanogent/history/jsonl/state
+mv /tmp/nanogent-backup/history/* .nanogent/history/jsonl/state/ 2>/dev/null || true
+
+mkdir -p .nanogent/tools/schedule/state
+[ -f /tmp/nanogent-backup/schedules.json ] && mv /tmp/nanogent-backup/schedules.json .nanogent/tools/schedule/state/schedules.json
+[ -f /tmp/nanogent-backup/schedule-log.jsonl ] && mv /tmp/nanogent-backup/schedule-log.jsonl .nanogent/tools/schedule/state/log.jsonl
+
+# - Remove the stale dirs:
+rm -rf .nanogent/state/history
+rm -f .nanogent/state/schedules.json .nanogent/state/schedule-log.jsonl
+
+nanogent start
+```
+
+If you were using the scheduler tool, schedules and their execution log will continue firing once restored — the jsonl format is byte-identical, only the file paths moved.
+
+**Why the changes:**
+
+- **Split plugins created silent half-functionality.** `scheduler/jsonl` + `tools/schedule` only worked if both were installed. The default profile shipped both, which papered over the problem for the happy path but left the contract ambiguous for anyone customising. Consolidation eliminates the mismatch.
+- **The nine-method `SchedulerPlugin` contract was over-structured.** Core's only interest was `claimDue` / `markComplete` / `markFailed` — which is really "call my tick callback" wearing a costume. The rest was CRUD between the tool and the backend, not between core and the backend.
+- **The lifecycle hook is the correct primitive for any proactive tool, not just scheduling.** Future tools that want to watch a webhook, poll an inbox, tail a log file, or listen for file-system events will use exactly the same seam: "run my loop in the background, call `fireSystemTurn` when I have something to say, stop cleanly on shutdown." A typed `SchedulerPlugin` seam would have forced each of those to invent its own plugin type.
+- **Plugin-owned state matches what `tools/claude` has always done** (`.nanogent/tools/claude/state/` since v0.8.0). Making `history/jsonl` and `tools/schedule` follow the same pattern removes the "except for these two" footnote.
+
+See [`.nanogent/tools/schedule/README.md`](template/tools/schedule/README.md), [DESIGN.md DR-010](./DESIGN.md#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook), and [DR-014](./DESIGN.md#dr-014-minimal-coreplugin-coupling) for the full rationale.
+
 Once running, a client just sends any text to the bot. The chat agent:
 
 1. Decides whether the message is addressed to it (calls `skip` if not)
@@ -690,7 +756,7 @@ A minimum-viable `plugin.json`:
 }
 ```
 
-`type` decides where the plugin lives on disk (`tools`, `channels`, `providers`, `history`, `memory`, `scheduler`); `name` must match the directory name. `files` is optional — when omitted, the installer copies every non-hidden top-level file in the plugin dir. See [DESIGN.md DR-013](./DESIGN.md#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data) for the full manifest contract.
+`type` decides where the plugin lives on disk (`tools`, `channels`, `providers`, `history`, `memory`); `name` must match the directory name. `files` is optional — when omitted, the installer copies every non-hidden top-level file in the plugin dir. See [DESIGN.md DR-013](./DESIGN.md#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data) for the full manifest contract.
 
 Minimum viable tool — `rag/index.ts`:
 
@@ -797,7 +863,7 @@ The default `claude` tool is the second case — it ships `.nanogent/tools/claud
 
 ## Managing plugins
 
-Same lifecycle applies to every plugin type — tools, channels, providers, history, memory, scheduler. `nanogent init` installs the plugins listed in the active profile (default: `template/profiles/default.json`), and after that `nanogent plugin` manages anything you want to add or remove:
+Same lifecycle applies to every plugin type — tools, channels, providers, history, memory. `nanogent init` installs the plugins listed in the active profile (default: `template/profiles/default.json`), and after that `nanogent plugin` manages anything you want to add or remove:
 
 ```bash
 nanogent plugin list                 # what's installed, with descriptions
@@ -956,7 +1022,6 @@ ln -s $REPO/channels         .nanogent/channels
 ln -s $REPO/providers        .nanogent/providers
 ln -s $REPO/history          .nanogent/history
 ln -s $REPO/memory           .nanogent/memory
-ln -s $REPO/scheduler        .nanogent/scheduler
 
 # Copy user-owned files so you can customise without dirtying the repo
 cp $REPO/prompt.md     .nanogent/prompt.md

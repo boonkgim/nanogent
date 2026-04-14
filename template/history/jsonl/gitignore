@@ -1,0 +1,5 @@
+# history/jsonl's own gitignore. Per DR-014, plugins own their state
+# location — our append-only per-contact JSONL files live under state/
+# inside this plugin dir. These are runtime data and must not be committed.
+
+state/

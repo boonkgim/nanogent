@@ -1,5 +1,0 @@
-{
-  "name": "jsonl",
-  "type": "scheduler",
-  "description": "JSONL-backed scheduler — definitions in state/schedules.json, execution log in state/schedule-log.jsonl"
-}

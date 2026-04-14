@@ -88,10 +88,6 @@ export interface ToolCtx {
     meta?: { toolName?: string; title?: string },
   ): void;
   busy(): ActiveJob | null;
-  // Scheduler plugin handle, if one is loaded. The bundled `schedule` tool
-  // talks to the agent's stored schedules through this. Null if no scheduler
-  // is installed — tools that need scheduling should surface a clear error.
-  scheduler: SchedulerPlugin | null;
   log(...args: unknown[]): void;
 }
 
@@ -101,11 +97,34 @@ export interface ToolResult {
   content?: string;
 }
 
+// Tool lifecycle context — passed to ToolPlugin.start() once at boot. A tool
+// that needs a background loop (timers, watchers, pollers) owns it inside
+// start() and returns a stop fn for clean shutdown. Core provides primitives
+// (`fireSystemTurn` to inject non-user turns, `pluginDir` for self-owned
+// state) and never reaches into the tool's folder. See DESIGN.md DR-014.
+export interface ToolStartCtx {
+  projectName: string;
+  projectDir: string;
+  pluginDir: string;               // the tool's own folder — put runtime data under pluginDir/state/
+  fireSystemTurn(opts: {
+    channel: string;
+    chatId: string;
+    contactId: string;
+    text: string;
+  }): void;
+  log(...args: unknown[]): void;
+}
+
 export interface ToolPlugin {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
   execute(input: Record<string, any>, ctx: ToolCtx): Promise<ToolResult | string>;
+  // Optional lifecycle hook for tools that hold state or run background
+  // loops. Called once after all tools are loaded. Return a stop fn (or
+  // void) — core calls it during shutdown. Failures inside start() are
+  // logged but do not block boot.
+  start?(ctx: ToolStartCtx): Promise<(() => void) | void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,8 +183,7 @@ export interface ProviderPlugin {
 export interface HistoryStoreCtx {
   projectName: string;
   projectDir: string;
-  stateDir: string;                // .nanogent/state (plugin should namespace under its own subdir)
-  pluginDir: string;               // the plugin's own folder on disk
+  pluginDir: string;               // the plugin's own folder — put runtime data under pluginDir/state/
   log(...args: unknown[]): void;
 }
 
@@ -193,8 +211,7 @@ export interface HistoryStorePlugin {
 export interface MemoryCtx {
   projectName: string;
   projectDir: string;
-  stateDir: string;                // .nanogent/state (plugin should namespace under its own subdir)
-  pluginDir: string;
+  pluginDir: string;               // the plugin's own folder — put runtime data under pluginDir/state/
   history: HistoryStorePlugin;     // injected — memory plugins read history via this handle
   log(...args: unknown[]): void;
 }
@@ -215,90 +232,6 @@ export interface MemoryPlugin {
   onRetract(contactId: string, count: number): Promise<void>;
   // Called by /clear.
   onClear(contactId: string): Promise<void>;
-}
-
-// ---------------------------------------------------------------------------
-// Scheduler plugin contract — time-based proactive triggers
-// ---------------------------------------------------------------------------
-//
-// A scheduler plugin owns BOTH schedule definitions (rules the agent set up)
-// AND the execution log (what actually fired, when, with what status). Core
-// ticks the scheduler once a minute and hands each due job to the existing
-// system-turn entry point (see fireSystemTurn in nanogent.ts), which routes
-// the synthetic trigger back to the origin channel + chat.
-//
-// Zero or one scheduler is active per install (unlike history/memory which
-// are required). If no scheduler is loaded, scheduling features silently
-// degrade — the tool plugin returns a clear error, the tick loop is a no-op.
-//
-// See DESIGN.md DR-010.
-
-export interface SchedulerCtx {
-  projectName: string;
-  projectDir: string;
-  stateDir: string;                // .nanogent/state (plugin should namespace under its own subdir)
-  pluginDir: string;
-  log(...args: unknown[]): void;
-}
-
-// Operator-provided input when the agent calls schedule_create.
-// `schedule` string format is plugin-defined; the bundled jsonl default
-// accepts: "once@<ISO-UTC>", "daily@HH:MM" (UTC), "every@<seconds>".
-export interface ScheduleSpec {
-  name: string;                    // human-readable label ("morning briefing")
-  schedule: string;                // when to fire — format depends on plugin
-  prompt: string;                  // what the agent should do when it fires
-  channel: string;                 // delivery route — filled in from the triggering turn
-  chatId: string;                  // delivery route
-  contactId: string;               // delivery route
-}
-
-// A stored schedule definition — spec + immutable metadata.
-export interface Schedule extends ScheduleSpec {
-  id: string;
-  createdAt: string;               // ISO timestamp
-}
-
-// Returned by claimDue — a due schedule wrapped with a per-fire jobId.
-// The plugin has already marked this as "in-flight" in its internal log
-// before returning it; core must call markComplete or markFailed.
-export interface ClaimedJob {
-  jobId: string;                   // unique per fire attempt
-  schedule: Schedule;              // full resolved definition
-  firedAt: string;                 // ISO of the time the schedule was due
-}
-
-// One execution record. Scheduler plugins expose the log for introspection
-// so the agent (or an operator tool) can answer "did my morning briefing
-// actually fire yesterday?".
-export interface ScheduleExecution {
-  firedAt: string;
-  scheduleId: string;
-  jobId: string;
-  status: 'claimed' | 'completed' | 'failed';
-  error?: string;
-}
-
-export interface SchedulerPlugin {
-  name: string;
-  init(ctx: SchedulerCtx): Promise<void>;
-
-  // Definition CRUD — called by the agent-facing `schedule` tool plugin.
-  createSchedule(spec: ScheduleSpec): Promise<Schedule>;
-  listSchedules(filter?: { contactId?: string }): Promise<Schedule[]>;
-  getSchedule(id: string): Promise<Schedule | null>;
-  deleteSchedule(id: string): Promise<boolean>;
-
-  // Execution — called by the core tick loop.
-  // claimDue MUST atomically mark returned jobs as in-flight so a second
-  // claimDue call (or a second process) doesn't re-fire the same schedule.
-  // The bundled jsonl default achieves this via a 'claimed' log entry.
-  claimDue(now: Date, limit?: number): Promise<ClaimedJob[]>;
-  markComplete(jobId: string): Promise<void>;
-  markFailed(jobId: string, error: string): Promise<void>;
-
-  // Introspection — agent/operator read-only access to execution history.
-  listExecutions(filter?: { scheduleId?: string; limit?: number }): Promise<ScheduleExecution[]>;
 }
 
 // ---------------------------------------------------------------------------

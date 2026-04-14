@@ -1,13 +1,13 @@
 // nanogent.ts — per-project chat agent core runtime.
 //
 // Owns:
-//   - plugin loaders (tools / channels / providers / history / memory / scheduler)
+//   - plugin loaders (tools / channels / providers / history / memory)
 //   - contacts.json parsing + access control
 //   - turn queue + per-contact turn routing
 //   - chat-agent tool-use loop (delegates one round-trip at a time to provider)
 //   - core tools (skip, check_job_status, cancel_job, learn)
 //   - job registry with crash recovery + async completion routing
-//   - scheduler tick loop + fireSystemTurn entry point for non-user turns
+//   - tool lifecycle orchestration (start/stop) + fireSystemTurn primitive
 //   - slash commands
 //
 // Does NOT own:
@@ -16,7 +16,8 @@
 //   - any specific capability (that's in .nanogent/tools/<name>/)
 //   - history storage format (that's in .nanogent/history/<name>/)
 //   - retrieval / windowing / RAG (that's in .nanogent/memory/<name>/)
-//   - schedule storage or cron parsing (that's in .nanogent/scheduler/<name>/)
+//   - time-based proactive triggers (that's a self-contained tool; see
+//     .nanogent/tools/schedule/ and DR-010/DR-014)
 //
 // See DESIGN.md at the repo root for decision rationale.
 
@@ -30,7 +31,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   ActiveJob, AccessDecision, ChannelCtx, ChannelPlugin, ChatEntry, Config, Contacts,
   ContentBlock, HistoryMessage, HistoryStorePlugin, IncomingMessage, MemoryPlugin,
-  ProviderPlugin, SchedulerPlugin, TextBlock, ToolCtx, ToolPlugin, ToolSchema,
+  ProviderPlugin, TextBlock, ToolCtx, ToolPlugin, ToolSchema, ToolStartCtx,
   ToolUseBlock,
 } from './types.d.ts';
 
@@ -47,7 +48,6 @@ const CHANNELS_DIR   = '.nanogent/channels';
 const PROVIDERS_DIR  = '.nanogent/providers';
 const HISTORY_DIR    = '.nanogent/history';
 const MEMORY_DIR     = '.nanogent/memory';
-const SCHEDULER_DIR  = '.nanogent/scheduler';
 const STATE_DIR      = '.nanogent/state';
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
 const JOBS_PATH      = `${STATE_DIR}/jobs.json`;
@@ -210,7 +210,6 @@ const channels = new Map<string, ChannelPlugin>();
 let provider: ProviderPlugin | null = null;
 let history: HistoryStorePlugin | null = null;
 let memory: MemoryPlugin | null = null;
-let scheduler: SchedulerPlugin | null = null;
 
 interface LoadedPlugin<T> {
   plugin: T;
@@ -333,7 +332,6 @@ async function loadAllPlugins(): Promise<void> {
   await history.init({
     projectName: PROJECT_NAME,
     projectDir:  process.cwd(),
-    stateDir:    STATE_DIR,
     pluginDir:   historyEntry.dir,
     log:         (...args) => { log(`[history:${history!.name}]`, ...args); },
   });
@@ -355,34 +353,52 @@ async function loadAllPlugins(): Promise<void> {
   await memory.init({
     projectName: PROJECT_NAME,
     projectDir:  process.cwd(),
-    stateDir:    STATE_DIR,
     pluginDir:   memoryEntry.dir,
     history,
     log:         (...args) => { log(`[memory:${memory!.name}]`, ...args); },
   });
   log(`loaded memory: ${memory.name}`);
+}
 
-  // Scheduler plugins — OPTIONAL (zero or one). If none is loaded,
-  // scheduling features silently degrade: the tick loop is a no-op and the
-  // bundled `schedule` tool surfaces a clear "scheduler not available" error.
-  const schedulerEntries = await loadPluginsFromDir<SchedulerPlugin>(SCHEDULER_DIR, 'scheduler');
-  if (schedulerEntries.length > 1) {
-    log(`warning: multiple schedulers found (${schedulerEntries.map(s => s.plugin.name).join(', ')}) — using first: ${schedulerEntries[0]!.plugin.name}`);
-  }
-  if (schedulerEntries.length >= 1) {
-    const schedulerEntry = schedulerEntries[0]!;
-    scheduler = schedulerEntry.plugin;
-    if (typeof scheduler.claimDue !== 'function' || typeof scheduler.createSchedule !== 'function') {
-      die(`scheduler ${scheduler.name}: missing required methods`);
-    }
-    await scheduler.init({
+// ---------------------------------------------------------------------------
+// Tool lifecycle — call start() on every tool that has one, after the full
+// plugin set is loaded. Tools that hold state or run background loops (the
+// bundled `schedule` tool, future watchers/pollers/webhooks) own them here.
+// Stop fns returned by start() are called in reverse order on shutdown.
+// A buggy start() is logged and swallowed — it must not block boot.
+// See DESIGN.md DR-014.
+// ---------------------------------------------------------------------------
+
+const toolStopFns: Array<{ name: string; stop: () => void }> = [];
+
+async function startTools(): Promise<void> {
+  for (const [name, tool] of tools) {
+    const t = tool as ToolPlugin;
+    if (typeof t.start !== 'function') continue;
+    const toolDir = toolDirs.get(name);
+    if (!toolDir) continue;
+    const ctx: ToolStartCtx = {
       projectName: PROJECT_NAME,
       projectDir:  process.cwd(),
-      stateDir:    STATE_DIR,
-      pluginDir:   schedulerEntry.dir,
-      log:         (...args) => { log(`[scheduler:${scheduler!.name}]`, ...args); },
-    });
-    log(`loaded scheduler: ${scheduler.name}`);
+      pluginDir:   toolDir,
+      fireSystemTurn,
+      log:         (...args) => { log(`[tool:${name}]`, ...args); },
+    };
+    try {
+      const stop = await t.start(ctx);
+      if (typeof stop === 'function') toolStopFns.push({ name, stop });
+      log(`started tool: ${name}`);
+    } catch (e) {
+      log(`tool ${name} start() failed —`, (e as Error)?.message || e);
+    }
+  }
+}
+
+function stopTools(): void {
+  while (toolStopFns.length > 0) {
+    const entry = toolStopFns.pop()!;
+    try { entry.stop(); }
+    catch (e) { log(`tool ${entry.name} stop() threw —`, (e as Error)?.message || e); }
   }
 }
 
@@ -557,7 +573,6 @@ function makeToolCtx(origin: Origin, toolDir: string): ToolCtx {
       });
     },
     busy: () => activeJob,
-    scheduler,
     log: (...args) => { log(`[tool:${origin.channel}]`, ...args); },
   };
 }
@@ -751,17 +766,18 @@ async function kickTurnWorker(): Promise<void> {
 
 /**
  * Inject a synthetic [SYSTEM] turn into the queue. This is the single entry
- * point for non-user-initiated turns — used by the scheduler tick loop today
- * and available to any future source of time-based or event-based triggers.
- * The resulting turn goes through the same per-contact serializer, memory
- * recall, tool-use loop, and channel send pipeline as a normal user turn;
- * the only difference is the trigger text is framed as a system message
- * rather than `[Name]: ...`.
+ * point for non-user-initiated turns — handed to tools via ToolStartCtx so
+ * any tool that runs proactive loops (the bundled `schedule` tool today,
+ * future webhooks / watchers / pollers) can drive the runtime without faking
+ * a user message. The resulting turn goes through the same per-contact
+ * serializer, memory recall, tool-use loop, and channel send pipeline as a
+ * normal user turn; the only difference is the trigger text is framed as a
+ * system message rather than `[Name]: ...`.
  *
- * Exported so that plugins and external callers (future webhooks, event
- * bridges) can drive the runtime without faking a user message.
+ * Not exported: plugins reach it through their start() ctx, not by importing
+ * core. See DESIGN.md DR-014.
  */
-export function fireSystemTurn(opts: {
+function fireSystemTurn(opts: {
   channel: string;
   chatId: string;
   contactId: string;
@@ -818,63 +834,6 @@ async function processTrigger(trigger: Trigger): Promise<void> {
       const ch = channels.get(channel);
       if (ch) await ch.sendMessage(chatId, `⚠️ error: ${(e as Error)?.message || String(e)}`);
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Scheduler tick loop — drives the optional scheduler plugin
-// ---------------------------------------------------------------------------
-//
-// Once a minute, ask the scheduler plugin which schedules are due, fan each
-// one into fireSystemTurn, then mark it complete (or failed if enqueueing
-// threw). Fire-and-forget semantics: the scheduler records "we fired this"
-// on enqueue success and does not wait for the turn to actually run. Turn-
-// level failures (provider errors, tool errors) are logged by processTrigger
-// like any other turn, not retried by the scheduler.
-//
-// If no scheduler plugin is loaded, this is a no-op.
-
-const SCHEDULER_TICK_MS = 60_000;
-let schedulerTickTimer: NodeJS.Timeout | null = null;
-
-async function schedulerTick(): Promise<void> {
-  if (!scheduler) return;
-  try {
-    const due = await scheduler.claimDue(new Date(), 10);
-    for (const job of due) {
-      try {
-        fireSystemTurn({
-          channel:   job.schedule.channel,
-          chatId:    job.schedule.chatId,
-          contactId: job.schedule.contactId,
-          text:      `[SCHEDULED "${job.schedule.name}"] ${job.schedule.prompt}`,
-        });
-        await scheduler.markComplete(job.jobId);
-        log(`scheduler fired ${job.schedule.id} "${job.schedule.name}" → ${job.schedule.contactId}`);
-      } catch (e) {
-        const msg = (e as Error)?.message || String(e);
-        try { await scheduler.markFailed(job.jobId, msg); } catch { /* ignore */ }
-        log(`scheduler fire failed ${job.schedule.id}:`, msg);
-      }
-    }
-  } catch (e) {
-    log('scheduler tick error', (e as Error)?.message || e);
-  }
-}
-
-function startSchedulerTick(): void {
-  if (!scheduler) return;
-  // Fire one tick immediately so any schedules that came due while the
-  // process was down get picked up right away, subject to the scheduler
-  // plugin's own missed-fire policy.
-  void schedulerTick();
-  schedulerTickTimer = setInterval(() => { void schedulerTick(); }, SCHEDULER_TICK_MS);
-}
-
-function stopSchedulerTick(): void {
-  if (schedulerTickTimer) {
-    clearInterval(schedulerTickTimer);
-    schedulerTickTimer = null;
   }
 }
 
@@ -1011,9 +970,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  startSchedulerTick();
+  await startTools();
 
-  log(`listening: project="${PROJECT_NAME}" model=${CHAT_MODEL} channels=[${[...channels.keys()].join(',')}] tools=[${[...tools.keys()].join(',')}] provider=${provider.name}${scheduler ? ` scheduler=${scheduler.name}` : ''}`);
+  log(`listening: project="${PROJECT_NAME}" model=${CHAT_MODEL} channels=[${[...channels.keys()].join(',')}] tools=[${[...tools.keys()].join(',')}] provider=${provider.name}`);
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
@@ -1021,7 +980,7 @@ async function main(): Promise<void> {
 
 function shutdown(): void {
   log('bye');
-  stopSchedulerTick();
+  stopTools();
   for (const stop of channelStopFns) {
     try { stop(); } catch { /* ignore */ }
   }

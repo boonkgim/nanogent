@@ -123,7 +123,7 @@ function copyFromManifest(manifest: ManifestEntry[]): void {
  *  extension point the runtime discovers (see template/core/nanogent.ts).
  *  Single source of truth for all plugin-tree walks below. */
 export const PLUGIN_TYPES = [
-  'tools', 'channels', 'providers', 'history', 'memory', 'scheduler',
+  'tools', 'channels', 'providers', 'history', 'memory',
 ] as const;
 export type PluginType = typeof PLUGIN_TYPES[number];
 

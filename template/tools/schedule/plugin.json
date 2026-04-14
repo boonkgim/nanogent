@@ -1,5 +1,6 @@
 {
   "name": "schedule",
   "type": "tools",
-  "description": "Agent-facing tool to create, list, and cancel scheduled triggers (pairs with a scheduler plugin)"
+  "description": "Agent-facing tool + self-contained proactive tick loop for time-based schedules (definitions and execution log live under this plugin's own state/ dir)",
+  "files": ["index.ts", "README.md", "gitignore"]
 }

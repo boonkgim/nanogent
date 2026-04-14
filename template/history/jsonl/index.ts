@@ -1,8 +1,9 @@
 // history/jsonl — default history store for nanogent.
 //
-// Append-only JSONL files, one per contactId, under .nanogent/state/history/.
-// Exactly the shape v0.4.x stored on disk — upgrading to v0.5.0 keeps the
-// existing files readable without a migration step.
+// Append-only JSONL files, one per contactId, under the plugin's own
+// `state/` subdir (.nanogent/history/jsonl/state/). Per DR-014, plugins
+// own their state location; the plugin dir's gitignore hides it from the
+// operator's repo.
 //
 // This plugin is **dumb on purpose**. It does not rotate, summarise, or
 // filter — it's the raw log. Windowing, relevance, and retrieval are the
@@ -63,7 +64,7 @@ const plugin: HistoryStorePlugin = {
   name: 'jsonl',
 
   async init(ctx: HistoryStoreCtx): Promise<void> {
-    historyDir = join(ctx.stateDir, 'history');
+    historyDir = join(ctx.pluginDir, 'state');
     log = ctx.log;
     mkdirSync(historyDir, { recursive: true });
   },
