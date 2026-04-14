@@ -1,29 +1,31 @@
 # nanogent
 
-A **per-project chat agent** reachable via Telegram, with pluggable tools. Zero npm dependencies. Decentralised by design — every project gets its own listener, its own prompt, its own tool set, its own lifecycle. The whole install lives in **one directory (`.nanogent/`)** you can commit, copy between projects, or delete wholesale.
+A **per-project chat agent** reachable via Telegram, with pluggable tools. Zero runtime npm dependencies. Decentralised by design — every project gets its own listener, its own prompt, its own tool set, its own lifecycle. The whole install lives in **one directory (`.nanogent/`)** you can commit, copy between projects, or delete wholesale.
+
+Requires **Node 24+** — the runtime ships as hand-written TypeScript and relies on Node's built-in type stripping. No build step, no transpiler, no bundler. What you read in `.nanogent/nanogent.ts` is what runs.
 
 By default, nanogent ships with one tool: **`claude`**, which delegates coding tasks to [Claude Code](https://docs.claude.com/claude-code). You can add more tools (`rag`, `search`, `opencode`, etc.) by dropping a folder into `.nanogent/tools/` — the core runtime never needs to change.
 
 ```
 ┌─────────┐     ┌────────────────────────────────────────┐      ┌─────────────┐
-│         │     │  nanogent.mjs (chat agent)             │      │   claude    │
+│         │     │  nanogent.ts (chat agent)              │      │   claude    │
 │Telegram │◀───▶│  ┌──────────────────────────────────┐  │─────▶│  (one tool, │
 │         │     │  │ loop: poll → turn → tool dispatch │  │ async│  not core)  │
 └─────────┘     │  └──────────────────────────────────┘  │      └─────────────┘
                 │         │          │          │        │      ┌─────────────┐
-                │         ▼          ▼          ▼        │─────▶│   rag.mjs   │
+                │         ▼          ▼          ▼        │─────▶│   rag.ts    │
                 │       skip       learn    check_job    │      │  (future)   │
                 │      (core)      (core)    (core)      │      └─────────────┘
                 └────────────────────────────────────────┘      ┌─────────────┐
-                         lives inside your project               │  codex.mjs  │
+                         lives inside your project               │  codex.ts   │
                                                                  │   (future)  │
                                                                  └─────────────┘
 ```
 
 ## Two layers, one file per tool
 
-- **Chat agent (core, `nanogent.mjs`)** — runs a small Anthropic API loop (Claude Haiku by default) to decide whether to answer the client directly, `skip` side chatter, `learn` a preference, `check_job_status`, `cancel_job`, or delegate to a project-specific tool.
-- **Tools (`.nanogent/tools/<name>/`)** — one folder per capability, each with a required `index.mjs` that default-exports `{ name, description, input_schema, execute(input, ctx) }`. Long-running tools return `{ async: true, jobId }` immediately and keep the chat agent responsive while they run. When a job finishes, a synthetic `[SYSTEM]` message is injected into the conversation and the chat agent decides how to tell the client.
+- **Chat agent (core, `nanogent.ts`)** — runs a small Anthropic API loop (Claude Haiku by default) to decide whether to answer the client directly, `skip` side chatter, `learn` a preference, `check_job_status`, `cancel_job`, or delegate to a project-specific tool.
+- **Tools (`.nanogent/tools/<name>/`)** — one folder per capability, each with a required `index.ts` that default-exports `{ name, description, input_schema, execute(input, ctx) }`. Long-running tools return `{ async: true, jobId }` immediately and keep the chat agent responsive while they run. When a job finishes, a synthetic `[SYSTEM]` message is injected into the conversation and the chat agent decides how to tell the client.
 
 This is the **open/closed** split: the core is closed for modification; tools are open for extension. Adding a new tool is dropping one file. The core knows nothing about `claude`, `opencode`, `rag`, or anything else specific.
 
@@ -40,10 +42,10 @@ Anthropic's [Claude Code Channels](https://code.claude.com/docs/en/channels) pus
 | Model | MCP plugin → running Claude Code session | Standalone chat agent → tools (one of which may be `claude`) |
 | Requires a live Claude Code session? | **Yes** | No — spawns `claude -p` on demand via the `claude` tool |
 | Permission prompts | **Pause remotely** | Bypassed via `--dangerously-skip-permissions` (allowlist gated) |
-| Deployable on a VPS / Raspberry Pi / headless box? | Awkward | Yes — `pm2 start nanogent.mjs` or `docker compose up -d` |
+| Deployable on a VPS / Raspberry Pi / headless box? | Awkward | Yes — `pm2 start nanogent.ts` or `docker compose up -d` |
 | Client-facing? | Developer-only | Yes — chat agent handles small talk, skipping, clarification |
 | Extensibility | MCP servers | Drop-in folder tools per project |
-| Moving parts | MCP server + pairing codes + session | One `.mjs` runtime + per-tool folders + `.env` |
+| Moving parts | MCP server + pairing codes + session | One `.ts` runtime + per-tool folders + `.env` |
 | Supported channels | Telegram, Discord, iMessage | Telegram only, by design |
 
 **Use Channels** when you're coding interactively and want a chat-flavored remote for your live session.
@@ -75,7 +77,9 @@ nanogent is opinionated. These principles shape every decision in the codebase �
 Each project owns its own listener, its own Telegram bot (or allowlisted chat IDs), its own system prompt, its own tool set. No central router, no shared config, no process that knows about every project at once. Start nanogent when you're working on a project, stop it when you're not, `rm -rf .nanogent/` when you're done. Teams running many projects run many nanogent instances — one per project — and each is individually startable, stoppable, and removable. If you find yourself wanting a central control plane, nanogent is the wrong tool.
 
 **Readable over clever.**
-The runtime is a single file (`.nanogent/nanogent.mjs`) with zero npm dependencies. It uses raw `fetch` against the Anthropic and Telegram APIs instead of pulling in the official SDKs. You should be able to `cat` it and understand the whole thing in one sitting — every tool dispatch, every queue, every piece of state. If a proposed change would make the file materially harder to read in exchange for a minor feature, the change loses.
+The runtime is a single file (`.nanogent/nanogent.ts`) with zero runtime npm dependencies. It uses raw `fetch` against the Anthropic and Telegram APIs instead of pulling in the official SDKs. You should be able to `cat` it and understand the whole thing in one sitting — every tool dispatch, every queue, every piece of state. If a proposed change would make the file materially harder to read in exchange for a minor feature, the change loses.
+
+Node's built-in type stripping (stable since Node 22.6, on by default since 24) erases the TypeScript annotations at parse time — no compilation, no emitted JavaScript, no source map indirection. The file that ships is the file that runs.
 
 **Drop a folder, delete a folder.**
 The whole install lives under `.nanogent/`. Nothing nanogent-related lives outside it — no symlinks, no system-wide state, no registry entries, no global npm package. Install is dropping a directory; uninstall is deleting one. Moving a project between machines is `cp -r .nanogent/`. If you're tempted to write state under `~/`, under `/etc/`, or in the user's project root, don't — put it in `.nanogent/`.
@@ -124,7 +128,8 @@ What lands in your project:
 ```
 your-project/
   .nanogent/
-    nanogent.mjs              ← core runtime (readable, auditable, committed)
+    nanogent.ts               ← core runtime (readable, auditable, committed)
+    types.d.ts                ← shared plugin contract types — committed
     config.json               ← non-secret settings (projectName, docker, chatModel) — committed
     contacts.json             ← access control + identity map — committed
     prompt.md                 ← system prompt — committed
@@ -136,15 +141,15 @@ your-project/
     state/                    ← runtime state (history, jobs, learnings) — gitignored
     tools/
       claude/                 ← default coding tool
-        index.mjs
+        index.ts
         README.md
     channels/
       telegram/               ← default channel plugin
-        index.mjs
+        index.ts
         README.md
     providers/
       anthropic/              ← default AI provider plugin
-        index.mjs
+        index.ts
         README.md
 ```
 
@@ -169,8 +174,8 @@ nanogent start --docker    # force docker mode
 **Background supervision** (node mode):
 
 ```bash
-nohup node .nanogent/nanogent.mjs > nanogent.log 2>&1 &    # quick & dirty
-pm2 start .nanogent/nanogent.mjs --name nanogent           # or pm2
+nohup node .nanogent/nanogent.ts > nanogent.log 2>&1 &    # quick & dirty
+pm2 start .nanogent/nanogent.ts --name nanogent           # or pm2
 ```
 
 **Docker specifics:** the container binds the project root (`..` from `.nanogent/`'s perspective) as `/workspace`, and mounts `~/.claude` + `~/.claude.json` so the `claude` tool can reuse your host auth. Recommended for VPS / VM / Pi setups where you'd rather not run `--dangerously-skip-permissions` directly on the host.
@@ -332,7 +337,7 @@ v0.4.0 is the **biggest structural change** since the original release. Telegram
 The net result from a user's perspective:
 
 - **Everything still lives under `.nanogent/`** — the top-level layout philosophy is unchanged
-- **`nanogent.mjs` is still one file you can audit** — ~30 KB, zero npm deps
+- **`nanogent.mjs` is still one file you can audit** — ~30 KB, zero npm deps (0.4.x shipped the pre-TS `.mjs` version)
 - **Access control is now more powerful and more explicit** — individual users with tool allowlists, per-chat restrictions, silent-drop of unknown chats by default
 
 To migrate an existing 0.3.x install:
@@ -372,6 +377,39 @@ nanogent start
 - Permissions are declared in `contacts.json`, not inside tool files. See DESIGN.md § DR-005.
 - User messages are always prefixed with `[displayName]:` for group chat attribution. See DESIGN.md § DR-003.
 
+### Migrating from 0.4.x
+
+v0.5.0 converts everything to TypeScript. The runtime still ships as a single hand-written file; the difference is that it now has type annotations, and Node strips them at parse time. **Nothing about the deployment model, `contacts.json` shape, or plugin contract changed** — the code is the same shape, just with types.
+
+**Requires Node 24+.** Node 22 and earlier cannot run `.ts` files directly. If you're stuck on an older Node, pin to the `0.4.x` release.
+
+```bash
+# 1. Upgrade Node to 24+ if needed
+node --version   # should print v24.x.x
+
+# 2. Update nanogent itself
+npm install -g nanogent@latest   # or your preferred install method
+
+# 3. Run the update — it drops the new .ts core runtime and a shared types.d.ts,
+#    and preserves your prompt / config / contacts / locally-modified plugins
+nanogent update
+
+# 4. The old .mjs files under .nanogent/ are stale — delete them by hand.
+#    `nanogent update` never removes files it didn't ship this version, so the
+#    old extensions must be cleaned up manually:
+rm -f .nanogent/nanogent.mjs
+rm -f .nanogent/tools/claude/index.mjs
+rm -f .nanogent/channels/telegram/index.mjs
+rm -f .nanogent/providers/anthropic/index.mjs
+
+# 5. Restart — history, learnings, and job state survive
+nanogent start
+```
+
+**If you hand-modified any plugin `index.mjs` file**, port those changes to the new `index.ts` before deleting the `.mjs`. `nanogent update` will skip updating a locally-modified `.mjs` → `.ts` plugin since the byte-compare check fails on a file that doesn't exist yet — so you'll see the new `.ts` version dropped cleanly, and your custom `.mjs` sitting alongside, ignored. Diff them by hand and port.
+
+**Plugin author note:** if you wrote a custom tool / channel / provider, rename `index.mjs` → `index.ts` and add types by importing from `../../types.d.ts`. See the shipped plugins for reference.
+
 Once running, a client just sends any text to the bot. The chat agent:
 
 1. Decides whether the message is addressed to it (calls `skip` if not)
@@ -394,25 +432,27 @@ Slash commands are cheap and instant (no LLM call); they operate directly on the
 
 ## Adding a tool
 
-A tool is a **folder** in `.nanogent/tools/` with one required file: `index.mjs`. Everything else in the folder — helpers, assets, schemas, README, tests — is the tool's own business.
+A tool is a **folder** in `.nanogent/tools/` with one required file: `index.ts`. Everything else in the folder — helpers, assets, schemas, README, tests — is the tool's own business.
 
 ```
 .nanogent/tools/
   claude/
-    index.mjs        ← REQUIRED. Default-exports the tool object.
+    index.ts         ← REQUIRED. Default-exports the tool object.
     README.md        ← recommended — setup notes, API keys, example invocations.
   rag/               ← example of a folder-shaped tool that outgrew one file
-    index.mjs
+    index.ts
     README.md
-    chunker.mjs      ← helpers the tool imports via normal relative imports
+    chunker.ts       ← helpers the tool imports via normal relative imports
     schemas/
       answer.json
 ```
 
-Minimum viable tool — `rag/index.mjs`:
+Minimum viable tool — `rag/index.ts`:
 
-```js
-export default {
+```ts
+import type { ToolCtx, ToolPlugin } from '../../types.d.ts';
+
+const plugin: ToolPlugin = {
   name: 'rag',
   description: 'Answer a question by searching the project\'s knowledge base.',
   input_schema: {
@@ -422,13 +462,17 @@ export default {
     },
     required: ['query'],
   },
-  async execute({ query }, ctx) {
+  async execute({ query }: { query?: string }, ctx: ToolCtx) {
     // Sync fast tool — just return the result.
-    const answer = await searchKnowledgeBase(query);
+    const answer = await searchKnowledgeBase(query ?? '');
     return { content: answer };
   },
 };
+
+export default plugin;
 ```
+
+Plain JavaScript works too — if you'd rather skip the types, write `export default { ... }` directly and rename the file to `.ts` with no annotations. Node strips nothing and runs it as-is. But the shared types in `.nanogent/types.d.ts` catch a lot of mistakes at author time, and cost nothing at runtime.
 
 For **long-running tools** (spawning a CLI, hitting a slow API, doing anything that takes more than a couple of seconds), return immediately with a job id and register a background promise:
 
@@ -474,7 +518,7 @@ What `ctx` provides:
 | `ctx.busy()` | Returns `null` or the currently-running job descriptor |
 | `ctx.log(...)` | Scoped logger |
 
-Tools are discovered at startup by scanning `.nanogent/tools/` for directories. Each directory must contain an `index.mjs` that default-exports `{ name, description, input_schema, execute }` — if the file is missing or the shape is wrong, the tool is skipped with a log line. Directories starting with `_` are ignored (scratch / wip space). No manifest, no config file, no naming rules beyond `index.mjs` — drop a folder, restart, it's loaded.
+Tools are discovered at startup by scanning `.nanogent/tools/` for directories. Each directory must contain an `index.ts` that default-exports `{ name, description, input_schema, execute }` — if the file is missing or the shape is wrong, the tool is skipped with a log line. Directories starting with `_` are ignored (scratch / wip space). No manifest, no config file, no naming rules beyond `index.ts` — drop a folder, restart, it's loaded.
 
 ### State & persistence
 
@@ -530,10 +574,10 @@ nanogent update --dry-run    # preview what would change, without touching files
 
 `nanogent update` knows the difference between three kinds of files in `.nanogent/`:
 
-- **Core code** (`nanogent.mjs`, `Dockerfile`, `docker-compose.yml`, `.env.example`) — always overwritten. No one should be customising these.
+- **Core code** (`nanogent.ts`, `types.d.ts`, `Dockerfile`, `docker-compose.yml`, `.env.example`) — always overwritten. No one should be customising these.
 - **Default plugins** (`tools/claude/`, `channels/telegram/`, `providers/anthropic/`) — overwritten only if the file is byte-identical to what we ship. If you've customised a plugin file, update skips it with a message like:
   ```
-  skipped:  .nanogent/tools/claude/index.mjs (locally modified — pass --force to overwrite)
+  skipped:  .nanogent/tools/claude/index.ts (locally modified — pass --force to overwrite)
   ```
   and tells you the exact `diff` command to compare your version against the shipped one. Pass `--force` if you actually want to reset a customisation.
 - **User config** (`prompt.md`, `config.json`, `contacts.json`, `.env`, `.gitignore`) — **never touched**. These are yours.
@@ -594,7 +638,7 @@ Uninstalling is deleting one directory. That's still the whole point.
 Yes, but Claude Code is the *coding* agent — it's expensive, slow, and designed to do real file-system work. nanogent's chat agent sits above it as a cheap, fast routing layer that handles small talk, clarification, `skip`, status checks, and decides whether a message actually needs the coding agent at all. That saves tokens, saves time, and lets you swap the coding backend (opencode, codex, gemini, your own CLI) without touching the conversation layer.
 
 **Can I run nanogent without the `claude` tool?**
-Yes. Delete `.nanogent/tools/claude.mjs` and nanogent becomes a pure chat bot with whatever other tools you have (or none at all — `skip` + `learn` + `check_job_status` + `cancel_job` still work for small-talk-only setups).
+Yes. Delete `.nanogent/tools/claude/` and nanogent becomes a pure chat bot with whatever other tools you have (or none at all — `skip` + `learn` + `check_job_status` + `cancel_job` still work for small-talk-only setups).
 
 **Can I have multiple coding tools at once (e.g. `claude` + `opencode`)?**
 Yes. Both tool files live side-by-side in `.nanogent/tools/`. Tell the chat agent in `.nanogent-prompt.md` which tool to prefer for which kinds of tasks (e.g. *"use `claude` for TypeScript, `opencode` for Python data work"*). Tools don't know about each other; the chat agent routes.
@@ -609,7 +653,25 @@ The chat agent handles it. It can answer directly, call `check_job_status`, call
 No. Telegram only, by design. If you need Discord or iMessage, [Claude Code Channels](https://code.claude.com/docs/en/channels) already covers those. Fork and swap the transport if you want another channel here.
 
 **Can I run multiple projects at once?**
-Yes — each project runs its own `nanogent.mjs`. Give each one its own bot token (or at least its own allowlisted chat) so messages don't cross wires.
+Yes — each project runs its own `nanogent.ts`. Give each one its own bot token (or at least its own allowlisted chat) so messages don't cross wires.
+
+## Development
+
+This is only relevant if you're hacking on nanogent itself (cloning this repo, not installing the npm package).
+
+```bash
+git clone https://github.com/boonkgim/nanogent.git
+cd nanogent
+npm install          # installs typescript + eslint + @types/node (dev-only)
+npm run typecheck    # tsc --noEmit against bin/, template/, tests/
+npm run lint         # eslint .
+npm test             # node:test against tests/
+```
+
+- **Runtime still has zero npm dependencies.** `npm install` only pulls devDependencies for the toolchain. The `template/` directory — what ships to users via `nanogent init` — imports nothing outside the Node stdlib.
+- **No build step.** There is no `dist/`, no compiled output, no emitted JavaScript. `tsc` is used in `--noEmit` mode just for typecheck. Node runs the `.ts` files directly via built-in type stripping.
+- **Tests use `node:test`** (built into Node) plus real temp directories via `fs.mkdtempSync`. No mocking framework, no test runner dependency.
+- **Pure helpers are exported from `template/nanogent.ts`** for testability: `findChat`, `resolveAccess`, `rotateHistory`, `isTurnStart`, `loadEnv`, `loadConfig`, `loadContacts`. The file is side-effect-free on import — actual runtime bootstrap only happens when the file is executed directly, so tests can import it cleanly.
 
 ## License
 

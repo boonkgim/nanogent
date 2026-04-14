@@ -11,4 +11,4 @@ services:
       # Reuse the host's claude auth (run `claude` once on the host first).
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.claude.json:/root/.claude.json
-    command: ["node", ".nanogent/nanogent.mjs"]
+    command: ["node", ".nanogent/nanogent.ts"]

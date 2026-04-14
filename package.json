@@ -1,17 +1,29 @@
 {
   "name": "nanogent",
-  "version": "0.4.1",
-  "description": "Per-project chat agent reachable via Telegram, with pluggable tools. Default tool delegates to Claude Code; additional tools are drop-in .mjs files.",
+  "version": "0.5.0",
+  "description": "Per-project chat agent reachable via Telegram, with pluggable tools. Default tool delegates to Claude Code; additional tools are drop-in .ts files.",
   "type": "module",
   "bin": {
-    "nanogent": "bin/cli.mjs"
+    "nanogent": "bin/cli.ts"
   },
   "files": [
     "bin",
     "template"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --test 'tests/**/*.test.ts'"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "eslint": "^9.14.0",
+    "typescript-eslint": "^8.15.0",
+    "@eslint/js": "^9.14.0"
   },
   "keywords": ["claude", "claude-code", "telegram", "bot", "agent", "nanogent"],
   "author": "Khur Boon Kgim",

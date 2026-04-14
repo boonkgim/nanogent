@@ -1,20 +1,33 @@
 // anthropic provider — one round-trip wrapper over Anthropic's Messages API.
 //
-// The core's chat-agent loop (nanogent.mjs) calls `chat(...)` once per model
+// The core's chat-agent loop (nanogent.ts) calls `chat(...)` once per model
 // response and handles the tool-use loop itself. This plugin just translates
 // between core's Anthropic-shaped canonical format and the actual HTTP API.
 // Raw fetch — no SDK dependency.
 
+import type { ProviderChatArgs, ProviderChatResult, ProviderPlugin } from '../../types.d.ts';
+
 const API_URL = 'https://api.anthropic.com/v1/messages';
 
-function apiKey() {
+function apiKey(): string {
   // Read from process.env at call time so re-reading .env across restarts works.
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) throw new Error('anthropic provider: missing ANTHROPIC_API_KEY');
   return key;
 }
 
-export default {
+interface AnthropicApiResponse {
+  stop_reason: string;
+  content: ProviderChatResult['content'];
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+}
+
+const plugin: ProviderPlugin = {
   name: 'anthropic',
 
   /**
@@ -30,7 +43,7 @@ export default {
    * Output (normalised):
    *   { stopReason, content, usage }
    */
-  async chat({ system, messages, tools, model, maxTokens }) {
+  async chat({ system, messages, tools, model, maxTokens }: ProviderChatArgs): Promise<ProviderChatResult> {
     const body = {
       model,
       max_tokens: maxTokens,
@@ -42,8 +55,8 @@ export default {
     const res = await fetch(API_URL, {
       method: 'POST',
       headers: {
-        'content-type':     'application/json',
-        'x-api-key':        apiKey(),
+        'content-type':      'application/json',
+        'x-api-key':         apiKey(),
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(body),
@@ -54,7 +67,7 @@ export default {
       throw new Error(`anthropic ${res.status}: ${text.slice(0, 500)}`);
     }
 
-    const data = await res.json();
+    const data = await res.json() as AnthropicApiResponse;
 
     return {
       stopReason: data.stop_reason,
@@ -68,3 +81,5 @@ export default {
     };
   },
 };
+
+export default plugin;

@@ -1,4 +1,4 @@
-// nanogent.mjs — per-project chat agent core runtime.
+// nanogent.ts — per-project chat agent core runtime.
 //
 // Owns:
 //   - plugin loaders (tools / channels / providers)
@@ -23,6 +23,12 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
+import type {
+  ActiveJob, AccessDecision, ChannelCtx, ChannelPlugin, ChatEntry, Config, Contacts,
+  ContentBlock, HistoryMessage, IncomingMessage, ProviderPlugin, TextBlock, ToolCtx,
+  ToolPlugin, ToolSchema, ToolUseBlock,
+} from './types.d.ts';
+
 // ---------------------------------------------------------------------------
 // Paths & config
 // ---------------------------------------------------------------------------
@@ -39,32 +45,43 @@ const HISTORY_DIR    = `${STATE_DIR}/history`;
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
 const JOBS_PATH      = `${STATE_DIR}/jobs.json`;
 
-mkdirSync(STATE_DIR,   { recursive: true });
-mkdirSync(HISTORY_DIR, { recursive: true });
+// Module-level runtime state. Populated by bootstrap() so that importing this
+// module from tests has no filesystem side effects.
+let config: Config = {};
+let contacts: Contacts = { alwaysAllowed: ['skip'], users: {}, chats: {} };
+let PROJECT_NAME = 'nanogent';
+let CHAT_MODEL   = 'claude-haiku-4-5';
+let MAX_HISTORY  = 80;
+let MAX_TOKENS   = 1024;
 
-// Load .env into process.env so plugins can read their own keys.
-for (const [k, v] of Object.entries(loadEnv(ENV_PATH))) {
-  if (process.env[k] === undefined) process.env[k] = v;
+function bootstrap(): void {
+  mkdirSync(STATE_DIR,   { recursive: true });
+  mkdirSync(HISTORY_DIR, { recursive: true });
+
+  // Load .env into process.env so plugins can read their own keys.
+  for (const [k, v] of Object.entries(loadEnv(ENV_PATH))) {
+    if (process.env[k] === undefined) process.env[k] = v;
+  }
+
+  config = loadConfig(CONFIG_PATH);
+  contacts = loadContacts(CONTACTS_PATH);
+
+  PROJECT_NAME = config.projectName || 'nanogent';
+  CHAT_MODEL   = process.env.NANOGENT_CHAT_MODEL  || config.chatModel   || 'claude-haiku-4-5';
+  MAX_HISTORY  = Number(process.env.NANOGENT_MAX_HISTORY || config.maxHistory || 80);
+  MAX_TOKENS   = Number(process.env.NANOGENT_MAX_TOKENS  || config.maxTokens  || 1024);
 }
-
-const config = loadConfig(CONFIG_PATH);
-const contacts = loadContacts(CONTACTS_PATH);
-
-const PROJECT_NAME = config.projectName || 'nanogent';
-const CHAT_MODEL   = process.env.NANOGENT_CHAT_MODEL  || config.chatModel   || 'claude-haiku-4-5';
-const MAX_HISTORY  = Number(process.env.NANOGENT_MAX_HISTORY || config.maxHistory || 80);
-const MAX_TOKENS   = Number(process.env.NANOGENT_MAX_TOKENS  || config.maxTokens  || 1024);
 
 // ---------------------------------------------------------------------------
 // Learnings (global, appended by the learn core tool)
 // ---------------------------------------------------------------------------
 
-function loadLearnings() {
+function loadLearnings(): string {
   if (!existsSync(LEARNINGS_PATH)) return '';
   try { return readFileSync(LEARNINGS_PATH, 'utf8'); } catch { return ''; }
 }
 
-function appendLearning(title, content) {
+function appendLearning(title: string, content: string): void {
   const date = new Date().toISOString().slice(0, 10);
   const entry = `\n## [${date}] ${title}\n${content}\n`;
   if (!existsSync(LEARNINGS_PATH)) {
@@ -81,9 +98,14 @@ function appendLearning(title, content) {
 /**
  * Look up a chat entry by (channel, chatId). Returns null if nothing matches.
  * Falls back to a wildcard entry (chatId === '*') for the channel if present.
+ * Pure — takes contacts as input.
  */
-function findChat(channel, chatId) {
-  const chats = contacts.chats || {};
+export function findChat(
+  contactsArg: Contacts,
+  channel: string,
+  chatId: string,
+): { key: string; chat: ChatEntry } | null {
+  const chats = contactsArg.chats || {};
   // Exact match first
   for (const [key, chat] of Object.entries(chats)) {
     if (chat.channel === channel && chat.chatId === chatId) {
@@ -101,27 +123,29 @@ function findChat(channel, chatId) {
 
 /**
  * Resolve an incoming message to an access decision + effective tool set.
- * Returns { allowed, reason, username?, displayName?, contactId, effectiveTools }
- * or { allowed: false, reason: 'unknown-chat' | 'chat-disabled' | 'unknown-user-no-guests' }.
+ * Pure — takes contacts + installed tool names as inputs.
  */
-function resolveAccess({ channel, chatId, user }) {
-  const match = findChat(channel, chatId);
+export function resolveAccess(
+  contactsArg: Contacts,
+  installedToolNames: string[],
+  { channel, chatId, user }: { channel: string; chatId: string; user: { id: string; displayName?: string } },
+): AccessDecision {
+  const match = findChat(contactsArg, channel, chatId);
   if (!match) return { allowed: false, reason: 'unknown-chat' };
 
   const { key: chatKey, chat } = match;
-  if (chat.enabled === false) return { allowed: false, reason: 'chat-disabled' };
+  if (chat.enabled === false) return { allowed: false, reason: 'chat-disabled', chatKey };
 
   // Resolve user to a username via chat.userMapping
   const mapping = chat.userMapping || {};
   const username = mapping[user.id];
 
-  const users = contacts.users || {};
-  const alwaysAllowed = contacts.alwaysAllowed || ['skip'];
-  const installedToolNames = [...tools.keys()];
+  const users = contactsArg.users || {};
+  const alwaysAllowed = contactsArg.alwaysAllowed || ['skip'];
 
-  let effectiveTools;
-  let displayName;
-  let isGuest;
+  let effectiveTools: string[];
+  let displayName: string;
+  let isGuest: boolean;
 
   if (username && users[username]) {
     // Known user
@@ -145,7 +169,8 @@ function resolveAccess({ channel, chatId, user }) {
   }
 
   // contactId = key for history lookup
-  const historyMode = chat.historyMode || (chat.chatId === '*' ? 'per-user' : 'shared');
+  const historyMode: 'shared' | 'per-user' =
+    chat.historyMode || (chat.chatId === '*' ? 'per-user' : 'shared');
   const contactId = historyMode === 'per-user'
     ? `${chatKey}/${sanitize(user.id)}`
     : chatKey;
@@ -163,11 +188,11 @@ function resolveAccess({ channel, chatId, user }) {
   };
 }
 
-function sanitize(s) {
+export function sanitize(s: string): string {
   return String(s).replace(/[^a-zA-Z0-9_.-]+/g, '_');
 }
 
-function unique(arr) {
+export function unique<T>(arr: T[]): T[] {
   return Array.from(new Set(arr));
 }
 
@@ -175,30 +200,30 @@ function unique(arr) {
 // History (per contactId)
 // ---------------------------------------------------------------------------
 
-/** @type {Map<string, Array<{role:string,content:any}>>} */
-const historyCache = new Map();
+const historyCache = new Map<string, HistoryMessage[]>();
 
-function historyPath(contactId) {
+function historyPath(contactId: string): string {
   return join(HISTORY_DIR, `${contactId.replace(/\//g, '__')}.jsonl`);
 }
 
-function loadHistoryFor(contactId) {
-  if (historyCache.has(contactId)) return historyCache.get(contactId);
+function loadHistoryFor(contactId: string): HistoryMessage[] {
+  const cached = historyCache.get(contactId);
+  if (cached) return cached;
   const p = historyPath(contactId);
-  let h = [];
+  let h: HistoryMessage[] = [];
   if (existsSync(p)) {
     try {
-      h = readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
-    } catch (e) { log('history load error', contactId, e?.message || e); }
+      h = readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l) as HistoryMessage);
+    } catch (e) { log('history load error', contactId, (e as Error)?.message || e); }
   }
   historyCache.set(contactId, h);
   return h;
 }
 
-function saveHistoryFor(contactId) {
+function saveHistoryFor(contactId: string): void {
   let h = historyCache.get(contactId) || [];
   if (h.length > MAX_HISTORY) {
-    h = rotateHistory(h);
+    h = rotateHistory(h, MAX_HISTORY);
     historyCache.set(contactId, h);
   }
   const p = historyPath(contactId);
@@ -206,29 +231,31 @@ function saveHistoryFor(contactId) {
   writeFileSync(p, h.map(m => JSON.stringify(m)).join('\n') + '\n');
 }
 
-function clearHistoryFor(contactId) {
+function clearHistoryFor(contactId: string): void {
   historyCache.set(contactId, []);
-  try { unlinkSync(historyPath(contactId)); } catch {}
+  try { unlinkSync(historyPath(contactId)); } catch { /* ignore */ }
 }
 
-function isTurnStart(message) {
+export function isTurnStart(message: HistoryMessage): boolean {
   if (message.role !== 'user') return false;
   if (typeof message.content === 'string') return true;
   if (!Array.isArray(message.content)) return false;
-  return !message.content.some(b => b?.type === 'tool_result');
+  return !message.content.some((b: ContentBlock) => b?.type === 'tool_result');
 }
 
 /**
  * Boundary-aware rotation — never leaves an orphan tool_result at head.
  */
-function rotateHistory(h) {
-  if (h.length <= MAX_HISTORY) return h;
-  const minStart = h.length - MAX_HISTORY;
+export function rotateHistory(h: HistoryMessage[], maxHistory: number): HistoryMessage[] {
+  if (h.length <= maxHistory) return h;
+  const minStart = h.length - maxHistory;
   for (let i = minStart; i < h.length; i++) {
-    if (isTurnStart(h[i])) return h.slice(i);
+    const msg = h[i];
+    if (msg && isTurnStart(msg)) return h.slice(i);
   }
   for (let i = h.length - 1; i >= 0; i--) {
-    if (isTurnStart(h[i])) return h.slice(i);
+    const msg = h[i];
+    if (msg && isTurnStart(msg)) return h.slice(i);
   }
   return [];
 }
@@ -237,28 +264,33 @@ function rotateHistory(h) {
 // Plugin loaders
 // ---------------------------------------------------------------------------
 
-/** @type {Map<string, any>} toolName → tool object */
-const tools = new Map();
-/** @type {Map<string, string>} toolName → absolute tool dir */
-const toolDirs = new Map();
-/** @type {Map<string, any>} channelName → channel object */
-const channels = new Map();
-/** @type {any} the active provider object */
-let provider = null;
+const tools = new Map<string, ToolPlugin | ToolSchema>();
+const toolDirs = new Map<string, string>();
+const channels = new Map<string, ChannelPlugin>();
+let provider: ProviderPlugin | null = null;
 
-async function loadPluginsFromDir(dir, kind) {
-  const loaded = [];
+interface LoadedPlugin<T> {
+  plugin: T;
+  dir: string;
+  entryName: string;
+}
+
+async function loadPluginsFromDir<T extends { name?: string }>(
+  dir: string,
+  kind: string,
+): Promise<LoadedPlugin<T>[]> {
+  const loaded: LoadedPlugin<T>[] = [];
   if (!existsSync(dir)) return loaded;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     if (entry.name.startsWith('_')) continue;
-    const indexPath = resolve(dir, entry.name, 'index.mjs');
+    const indexPath = resolve(dir, entry.name, 'index.ts');
     if (!existsSync(indexPath)) {
-      log(`${kind} ${entry.name}: missing index.mjs, skipping`);
+      log(`${kind} ${entry.name}: missing index.ts, skipping`);
       continue;
     }
     try {
-      const mod = await import(pathToFileURL(indexPath).href);
+      const mod = await import(pathToFileURL(indexPath).href) as { default?: T };
       const plugin = mod.default;
       if (!plugin?.name) {
         log(`${kind} ${entry.name}: missing 'name' export, skipping`);
@@ -266,13 +298,13 @@ async function loadPluginsFromDir(dir, kind) {
       }
       loaded.push({ plugin, dir: resolve(dir, entry.name), entryName: entry.name });
     } catch (e) {
-      log(`${kind} ${entry.name}: load error`, e?.message || e);
+      log(`${kind} ${entry.name}: load error`, (e as Error)?.message || e);
     }
   }
   return loaded;
 }
 
-async function loadAllPlugins() {
+async function loadAllPlugins(): Promise<void> {
   // Core tools — always present, not in .nanogent/tools/
   tools.set('skip', {
     name: 'skip',
@@ -305,18 +337,18 @@ async function loadAllPlugins() {
   });
 
   // Plugin tools
-  for (const { plugin, dir, entryName } of await loadPluginsFromDir(TOOLS_DIR, 'tool')) {
+  for (const { plugin, dir, entryName } of await loadPluginsFromDir<ToolPlugin>(TOOLS_DIR, 'tool')) {
     if (typeof plugin.execute !== 'function') {
       log(`tool ${entryName}: missing execute(), skipping`);
       continue;
     }
     tools.set(plugin.name, plugin);
     toolDirs.set(plugin.name, dir);
-    log(`loaded tool: ${plugin.name} (${entryName}/index.mjs)`);
+    log(`loaded tool: ${plugin.name} (${entryName}/index.ts)`);
   }
 
   // Channel plugins
-  for (const { plugin, entryName } of await loadPluginsFromDir(CHANNELS_DIR, 'channel')) {
+  for (const { plugin, entryName } of await loadPluginsFromDir<ChannelPlugin>(CHANNELS_DIR, 'channel')) {
     if (typeof plugin.start !== 'function' || typeof plugin.sendMessage !== 'function') {
       log(`channel ${entryName}: missing start() or sendMessage(), skipping`);
       continue;
@@ -329,14 +361,14 @@ async function loadAllPlugins() {
   }
 
   // Provider plugins — exactly one
-  const providerEntries = await loadPluginsFromDir(PROVIDERS_DIR, 'provider');
+  const providerEntries = await loadPluginsFromDir<ProviderPlugin>(PROVIDERS_DIR, 'provider');
   if (providerEntries.length === 0) {
     die('no provider loaded — install exactly one provider under .nanogent/providers/');
   }
   if (providerEntries.length > 1) {
-    log(`warning: multiple providers found (${providerEntries.map(p => p.plugin.name).join(', ')}) — using first: ${providerEntries[0].plugin.name}`);
+    log(`warning: multiple providers found (${providerEntries.map(p => p.plugin.name).join(', ')}) — using first: ${providerEntries[0]!.plugin.name}`);
   }
-  provider = providerEntries[0].plugin;
+  provider = providerEntries[0]!.plugin;
   if (typeof provider.chat !== 'function') {
     die(`provider ${provider.name}: missing chat() method`);
   }
@@ -347,18 +379,16 @@ async function loadAllPlugins() {
 // Job registry (in-memory + crash-recovery persistence)
 // ---------------------------------------------------------------------------
 
-/**
- * @type {null | {
- *   jobId: string, toolName: string, title: string, startedAt: number,
- *   cancel: () => void,
- *   origin: { channel: string, chatId: string, contactId: string, displayName: string }
- * }}
- */
-let activeJob = null;
+interface RuntimeJob extends ActiveJob {
+  cancel: () => void;
+  origin: { channel: string; chatId: string; contactId: string; displayName: string };
+}
 
-function newJobId() { return randomUUID().slice(0, 8); }
+let activeJob: RuntimeJob | null = null;
 
-function persistActiveJob() {
+function newJobId(): string { return randomUUID().slice(0, 8); }
+
+function persistActiveJob(): void {
   try {
     if (activeJob) {
       writeFileSync(JOBS_PATH, JSON.stringify({
@@ -369,18 +399,18 @@ function persistActiveJob() {
         origin:    activeJob.origin,
       }) + '\n');
     } else {
-      try { unlinkSync(JOBS_PATH); } catch {}
+      try { unlinkSync(JOBS_PATH); } catch { /* ignore */ }
     }
-  } catch (e) { log('job persist error', e?.message || e); }
+  } catch (e) { log('job persist error', (e as Error)?.message || e); }
 }
 
-function recoverInterruptedJob() {
+function recoverInterruptedJob(): void {
   if (!existsSync(JOBS_PATH)) return;
-  let stale;
+  let stale: RuntimeJob | null = null;
   try {
-    stale = JSON.parse(readFileSync(JOBS_PATH, 'utf8'));
-  } catch { try { unlinkSync(JOBS_PATH); } catch {}; return; }
-  try { unlinkSync(JOBS_PATH); } catch {}
+    stale = JSON.parse(readFileSync(JOBS_PATH, 'utf8')) as RuntimeJob;
+  } catch { try { unlinkSync(JOBS_PATH); } catch { /* ignore */ } return; }
+  try { unlinkSync(JOBS_PATH); } catch { /* ignore */ }
   if (!stale?.jobId || !stale?.origin?.contactId) return;
   const elapsed = Math.round((Date.now() - (stale.startedAt || Date.now())) / 1000);
   log(`recovered interrupted job: ${stale.jobId} (${stale.toolName}, "${stale.title}", ~${elapsed}s old)`);
@@ -392,16 +422,25 @@ function recoverInterruptedJob() {
   saveHistoryFor(stale.origin.contactId);
 }
 
-function registerJob({ jobId, toolName, title, cancel, promise, origin }) {
+interface RegisterJobArgs {
+  jobId: string;
+  toolName: string;
+  title: string;
+  cancel: () => void;
+  promise: Promise<unknown>;
+  origin: { channel: string; chatId: string; contactId: string; displayName: string };
+}
+
+function registerJob({ jobId, toolName, title, cancel, promise, origin }: RegisterJobArgs): void {
   activeJob = { jobId, toolName, title, startedAt: Date.now(), cancel, origin };
   persistActiveJob();
   promise.then(
-    result => onJobComplete(jobId, 'completed', result),
-    err    => onJobComplete(jobId, 'failed', err?.message || String(err)),
+    result => { onJobComplete(jobId, 'completed', result); },
+    err    => { onJobComplete(jobId, 'failed', (err as Error)?.message || String(err)); },
   );
 }
 
-function onJobComplete(jobId, status, result) {
+function onJobComplete(jobId: string, status: string, result: unknown): void {
   if (!activeJob || activeJob.jobId !== jobId) return;
   const { toolName, title, startedAt, origin } = activeJob;
   const elapsed = Math.round((Date.now() - startedAt) / 1000);
@@ -425,19 +464,19 @@ function onJobComplete(jobId, status, result) {
 // Core tool handlers
 // ---------------------------------------------------------------------------
 
-function coreCheckJobStatus() {
+function coreCheckJobStatus(): string {
   if (!activeJob) return 'No job running. Idle.';
   const secs = Math.round((Date.now() - activeJob.startedAt) / 1000);
   return `Running: '${activeJob.title}' (tool=${activeJob.toolName}, id=${activeJob.jobId}, ${secs}s elapsed).`;
 }
 
-function coreCancelJob() {
+function coreCancelJob(): string {
   if (!activeJob) return 'No job to cancel.';
   try { activeJob.cancel?.(); return `Cancel requested for '${activeJob.title}' (id=${activeJob.jobId}).`; }
-  catch (e) { return `Cancel attempted but threw: ${e?.message || String(e)}`; }
+  catch (e) { return `Cancel attempted but threw: ${(e as Error)?.message || String(e)}`; }
 }
 
-function coreLearn({ title, content }) {
+function coreLearn({ title, content }: { title?: string; content?: string }): string {
   if (!title || !content) return 'error: learn requires both title and content';
   appendLearning(title, content);
   return `Saved: "${title}"`;
@@ -447,7 +486,13 @@ function coreLearn({ title, content }) {
 // Tool execution
 // ---------------------------------------------------------------------------
 
-async function executeTool(name, input, origin) {
+interface Origin { channel: string; chatId: string; contactId: string }
+
+async function executeTool(
+  name: string,
+  input: Record<string, any>,
+  origin: Origin,
+): Promise<unknown> {
   const tool = tools.get(name);
   if (!tool) return `error: unknown tool '${name}'`;
 
@@ -457,19 +502,25 @@ async function executeTool(name, input, origin) {
   if (name === 'learn')             return coreLearn(input || {});
 
   // Plugin tool — build ctx with this tool's own folder and origin info.
-  const ctx = makeToolCtx(origin, toolDirs.get(name));
+  const toolDir = toolDirs.get(name);
+  if (!toolDir || typeof (tool as ToolPlugin).execute !== 'function') {
+    return `error: tool '${name}' is not executable`;
+  }
+  const ctx = makeToolCtx(origin, toolDir);
   try {
-    const res = await tool.execute(input || {}, ctx);
-    if (res?.async && res?.jobId) {
+    const res = await (tool as ToolPlugin).execute(input || {}, ctx);
+    if (typeof res === 'object' && res && 'async' in res && res.async && res.jobId) {
       return res.content || `Job ${res.jobId} started — you'll be notified on completion.`;
     }
-    return res?.content ?? (typeof res === 'string' ? res : JSON.stringify(res ?? {}));
+    if (typeof res === 'string') return res;
+    if (res && typeof res === 'object' && 'content' in res) return res.content ?? JSON.stringify(res);
+    return JSON.stringify(res ?? {});
   } catch (e) {
-    return `error: tool '${name}' threw: ${e?.message || String(e)}`;
+    return `error: tool '${name}' threw: ${(e as Error)?.message || String(e)}`;
   }
 }
 
-function makeToolCtx(origin, toolDir) {
+function makeToolCtx(origin: Origin, toolDir: string): ToolCtx {
   const channel = channels.get(origin.channel);
   return {
     projectName: PROJECT_NAME,
@@ -478,11 +529,11 @@ function makeToolCtx(origin, toolDir) {
     channel:     origin.channel,
     chatId:      origin.chatId,
     contactId:   origin.contactId,
-    async sendMessage(text) {
-      return channel?.sendMessage(origin.chatId, text);
+    async sendMessage(text: string) {
+      return channel?.sendMessage(origin.chatId, text) ?? null;
     },
     async editMessage(handle, text) {
-      return channel?.editMessage(origin.chatId, handle, text);
+      if (channel) await channel.editMessage(origin.chatId, handle, text);
     },
     newJobId,
     backgroundJob(jobId, promise, cancel, meta = {}) {
@@ -492,11 +543,11 @@ function makeToolCtx(origin, toolDir) {
         title:    meta.title    || '(untitled)',
         cancel,
         promise,
-        origin,
+        origin: { ...origin, displayName: 'SYSTEM' },
       });
     },
     busy: () => activeJob,
-    log: (...args) => log(`[tool:${origin.channel}]`, ...args),
+    log: (...args) => { log(`[tool:${origin.channel}]`, ...args); },
   };
 }
 
@@ -504,7 +555,7 @@ function makeToolCtx(origin, toolDir) {
 // Chat-agent turn execution
 // ---------------------------------------------------------------------------
 
-function buildSystemPrompt() {
+function buildSystemPrompt(): TextBlock[] {
   const base = existsSync(PROMPT_PATH) ? readFileSync(PROMPT_PATH, 'utf8') : DEFAULT_SYSTEM_PROMPT;
   const project = `\n\n## Project\nYou are operating inside the "${PROJECT_NAME}" nanogent project.`;
   const learnings = loadLearnings();
@@ -513,24 +564,24 @@ function buildSystemPrompt() {
     : '';
   const learnSection = learnings.trim() ? `\n\n${learnings.trim()}` : '';
   const dynamic = `${project}${learnSection}${jobState}`;
-  const blocks = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
+  const blocks: TextBlock[] = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
   if (dynamic) blocks.push({ type: 'text', text: dynamic });
   return blocks;
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are a friendly project assistant talking to a client via chat. You have access to tools for doing real work — prefer calling them over making things up. If a message is side chatter not addressed to you, call skip. User messages are always prefixed with [Name]: — use the name to address speakers and tell participants apart in group chats.`;
 
-function toolSchemasFor(effectiveTools) {
-  const arr = effectiveTools
+function toolSchemasFor(effectiveTools: string[]): ToolSchema[] {
+  const arr: ToolSchema[] = effectiveTools
     .map(name => tools.get(name))
-    .filter(Boolean)
+    .filter((t): t is ToolPlugin | ToolSchema => Boolean(t))
     .map(t => ({
       name: t.name,
       description: t.description,
       input_schema: t.input_schema,
     }));
   if (arr.length > 0) {
-    arr[arr.length - 1].cache_control = { type: 'ephemeral' };
+    arr[arr.length - 1]!.cache_control = { type: 'ephemeral' };
   }
   return arr;
 }
@@ -539,7 +590,8 @@ function toolSchemasFor(effectiveTools) {
  * Run one chat-agent turn against the given contact's history.
  * Returns the assistant text to send back (or null if skipped).
  */
-async function runTurn(origin, effectiveTools) {
+async function runTurn(origin: Origin, effectiveTools: string[]): Promise<string | null> {
+  if (!provider) throw new Error('provider not loaded');
   const history = loadHistoryFor(origin.contactId);
   const toolList = toolSchemasFor(effectiveTools);
 
@@ -561,13 +613,14 @@ async function runTurn(origin, effectiveTools) {
       return null;
     }
 
-    const toolResults = [];
+    const toolResults: ContentBlock[] = [];
     for (const block of response.content) {
       if (block.type !== 'tool_use') continue;
-      const result = await executeTool(block.name, block.input || {}, origin);
+      const toolUse = block as ToolUseBlock;
+      const result = await executeTool(toolUse.name, toolUse.input || {}, origin);
       toolResults.push({
         type: 'tool_result',
-        tool_use_id: block.id,
+        tool_use_id: toolUse.id,
         content: typeof result === 'string' ? result : JSON.stringify(result),
       });
     }
@@ -591,7 +644,7 @@ async function runTurn(origin, effectiveTools) {
   saveHistoryFor(origin.contactId);
 
   const text = response.content
-    .filter(b => b.type === 'text')
+    .filter((b): b is TextBlock => b.type === 'text')
     .map(b => b.text)
     .join('\n')
     .trim();
@@ -602,29 +655,39 @@ async function runTurn(origin, effectiveTools) {
 // Turn queue (per contactId — serialises per conversation, not per process)
 // ---------------------------------------------------------------------------
 
-/** @type {Array<any>} */
-const turnQueue = [];
-let turnRunning = false;
-
-function enqueueTurn(trigger) {
-  turnQueue.push(trigger);
-  kickTurnWorker();
+interface Trigger {
+  channel: string;
+  chatId: string;
+  contactId: string;
+  displayName: string;
+  isGuest: boolean;
+  effectiveTools: string[] | null;
+  text: string;
+  isSystemTrigger?: boolean;
 }
 
-async function kickTurnWorker() {
+const turnQueue: Trigger[] = [];
+let turnRunning = false;
+
+function enqueueTurn(trigger: Trigger): void {
+  turnQueue.push(trigger);
+  void kickTurnWorker();
+}
+
+async function kickTurnWorker(): Promise<void> {
   if (turnRunning) return;
   turnRunning = true;
   try {
     while (turnQueue.length) {
       const trigger = turnQueue.shift();
-      await processTrigger(trigger);
+      if (trigger) await processTrigger(trigger);
     }
   } finally {
     turnRunning = false;
   }
 }
 
-async function processTrigger(trigger) {
+async function processTrigger(trigger: Trigger): Promise<void> {
   const { channel, chatId, contactId, displayName, text, effectiveTools, isSystemTrigger } = trigger;
 
   // For system triggers (job completion, recovery), recompute effective tools
@@ -632,7 +695,7 @@ async function processTrigger(trigger) {
   // have had when triggered by a fresh user message.
   let perTurnTools = effectiveTools;
   if (isSystemTrigger || !perTurnTools) {
-    const match = findChat(channel, chatId);
+    const match = findChat(contacts, channel, chatId);
     if (!match) { log('system trigger for unknown chat, dropping'); return; }
     // System messages don't belong to a specific caller, so we grant the
     // union of alwaysAllowed and the chat's userTools (the superset a known
@@ -644,7 +707,7 @@ async function processTrigger(trigger) {
     perTurnTools = unique([...alwaysAllowed, ...chatUserTools]).filter(t => installed.includes(t));
   }
 
-  const origin = { channel, chatId, contactId };
+  const origin: Origin = { channel, chatId, contactId };
   const history = loadHistoryFor(contactId);
 
   const prefix = isSystemTrigger ? '' : `[${displayName}]: `;
@@ -658,10 +721,10 @@ async function processTrigger(trigger) {
       if (ch) await ch.sendMessage(chatId, reply);
     }
   } catch (e) {
-    log('turn error', e?.message || e);
+    log('turn error', (e as Error)?.message || e);
     if (!isSystemTrigger) {
       const ch = channels.get(channel);
-      if (ch) await ch.sendMessage(chatId, `⚠️ error: ${e?.message || String(e)}`);
+      if (ch) await ch.sendMessage(chatId, `⚠️ error: ${(e as Error)?.message || String(e)}`);
     }
   }
 }
@@ -670,28 +733,31 @@ async function processTrigger(trigger) {
 // Slash commands (operator shortcuts, bypass the LLM)
 // ---------------------------------------------------------------------------
 
-async function handleSlash(text, origin) {
+async function handleSlash(text: string, origin: Origin): Promise<void> {
   const ch = channels.get(origin.channel);
   if (!ch) return;
-  const say = t => ch.sendMessage(origin.chatId, t);
+  const say = (t: string) => ch.sendMessage(origin.chatId, t);
 
   if (text === '/status') {
-    if (!activeJob) return say('💤 idle');
+    if (!activeJob) { await say('💤 idle'); return; }
     const secs = Math.round((Date.now() - activeJob.startedAt) / 1000);
-    return say(`🏃 ${activeJob.title}\n(tool=${activeJob.toolName}, id=${activeJob.jobId}, ${secs}s)`);
+    await say(`🏃 ${activeJob.title}\n(tool=${activeJob.toolName}, id=${activeJob.jobId}, ${secs}s)`);
+    return;
   }
   if (text === '/cancel') {
-    if (!activeJob) return say('nothing to cancel');
-    try { activeJob.cancel?.(); } catch {}
-    return say(`🛑 cancel requested (${activeJob.jobId})`);
+    if (!activeJob) { await say('nothing to cancel'); return; }
+    try { activeJob.cancel?.(); } catch { /* ignore */ }
+    await say(`🛑 cancel requested (${activeJob.jobId})`);
+    return;
   }
   if (text === '/clear') {
-    if (activeJob) return say('⚠️ a job is running — /cancel first, then /clear');
+    if (activeJob) { await say('⚠️ a job is running — /cancel first, then /clear'); return; }
     clearHistoryFor(origin.contactId);
-    return say('✨ history cleared — next message starts fresh');
+    await say('✨ history cleared — next message starts fresh');
+    return;
   }
   if (text === '/help' || text === '/start') {
-    return say([
+    await say([
       `Hi — send me any message and I will help with the "${PROJECT_NAME}" project.`,
       '',
       'Operator shortcuts:',
@@ -700,15 +766,16 @@ async function handleSlash(text, origin) {
       '/clear  — wipe chat history',
       '/help   — this message',
     ].join('\n'));
+    return;
   }
-  return say('unknown command. try /status /cancel /clear /help');
+  await say('unknown command. try /status /cancel /clear /help');
 }
 
 // ---------------------------------------------------------------------------
 // Channel plugin ctx — passed to each channel's start()
 // ---------------------------------------------------------------------------
 
-function makeChannelCtx(channelName) {
+function makeChannelCtx(channelName: string): ChannelCtx {
   return {
     projectName: PROJECT_NAME,
 
@@ -717,7 +784,7 @@ function makeChannelCtx(channelName) {
      * (including mode, historyMode, etc.) or null if unknown.
      */
     getChatConfig(channel, chatId) {
-      const match = findChat(channel, chatId);
+      const match = findChat(contacts, channel, chatId);
       return match ? match.chat : null;
     },
 
@@ -729,23 +796,23 @@ function makeChannelCtx(channelName) {
       handleIncomingMessage(msg);
     },
 
-    log: (...args) => log(`[channel:${channelName}]`, ...args),
+    log: (...args) => { log(`[channel:${channelName}]`, ...args); },
   };
 }
 
-function handleIncomingMessage(msg) {
+function handleIncomingMessage(msg: IncomingMessage): void {
   const { channel, chatId, user, text } = msg;
   const trimmed = (text || '').trim();
   if (!trimmed) return;
 
   // Resolve access (allowlist + permission).
-  const access = resolveAccess({ channel, chatId, user });
+  const access = resolveAccess(contacts, [...tools.keys()], { channel, chatId, user });
   if (!access.allowed) {
     log(`drop [${access.reason}] channel=${channel} chatId=${chatId} user=${user.id} name="${user.displayName || ''}" preview="${trimmed.slice(0, 60)}"`);
     return;
   }
 
-  const origin = {
+  const origin: Origin = {
     channel,
     chatId,
     contactId: access.contactId,
@@ -753,7 +820,7 @@ function handleIncomingMessage(msg) {
 
   // Slash commands bypass the chat agent entirely.
   if (trimmed.startsWith('/')) {
-    handleSlash(trimmed, origin);
+    void handleSlash(trimmed, origin);
     return;
   }
 
@@ -770,9 +837,10 @@ function handleIncomingMessage(msg) {
 // Main
 // ---------------------------------------------------------------------------
 
-const channelStopFns = [];
+const channelStopFns: Array<() => void> = [];
 
-async function main() {
+async function main(): Promise<void> {
+  bootstrap();
   await loadAllPlugins();
   recoverInterruptedJob();
 
@@ -781,20 +849,24 @@ async function main() {
       const stop = await channel.start(makeChannelCtx(name));
       if (typeof stop === 'function') channelStopFns.push(stop);
     } catch (e) {
-      log(`channel ${name}: start failed —`, e?.message || e);
+      log(`channel ${name}: start failed —`, (e as Error)?.message || e);
     }
   }
 
+  if (!provider) {
+    die('provider not loaded');
+    return;
+  }
   log(`listening: project="${PROJECT_NAME}" model=${CHAT_MODEL} channels=[${[...channels.keys()].join(',')}] tools=[${[...tools.keys()].join(',')}] provider=${provider.name}`);
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
 
-function shutdown() {
+function shutdown(): void {
   log('bye');
   for (const stop of channelStopFns) {
-    try { stop(); } catch {}
+    try { stop(); } catch { /* ignore */ }
   }
   process.exit(0);
 }
@@ -803,18 +875,18 @@ function shutdown() {
 // Utils
 // ---------------------------------------------------------------------------
 
-function log(...args) {
+function log(...args: unknown[]): void {
   console.log(`[nanogent project=${PROJECT_NAME}]`, ...args);
 }
 
-function die(msg) {
+function die(msg: string): void {
   console.error(`[nanogent] ${msg}`);
   process.exit(1);
 }
 
-function loadEnv(path) {
+export function loadEnv(path: string): Record<string, string> {
   if (!existsSync(path)) return {};
-  const out = {};
+  const out: Record<string, string> = {};
   for (const line of readFileSync(path, 'utf8').split('\n')) {
     const l = line.trim();
     if (!l || l.startsWith('#')) continue;
@@ -825,26 +897,34 @@ function loadEnv(path) {
   return out;
 }
 
-function loadConfig(path) {
+export function loadConfig(path: string): Config {
   if (!existsSync(path)) return {};
-  try { return JSON.parse(readFileSync(path, 'utf8')); }
-  catch (e) { console.error(`[nanogent] warning: failed to parse ${path}: ${e?.message || e}`); return {}; }
+  try { return JSON.parse(readFileSync(path, 'utf8')) as Config; }
+  catch (e) { console.error(`[nanogent] warning: failed to parse ${path}: ${(e as Error)?.message || e}`); return {}; }
 }
 
-function loadContacts(path) {
+export function loadContacts(path: string): Contacts {
   if (!existsSync(path)) return { alwaysAllowed: ['skip'], users: {}, chats: {} };
   try {
-    const c = JSON.parse(readFileSync(path, 'utf8'));
+    const c = JSON.parse(readFileSync(path, 'utf8')) as Partial<Contacts>;
     return {
       alwaysAllowed: c.alwaysAllowed || ['skip'],
       users:         c.users || {},
       chats:         c.chats || {},
     };
   } catch (e) {
-    console.error(`[nanogent] warning: failed to parse ${path}: ${e?.message || e}`);
+    console.error(`[nanogent] warning: failed to parse ${path}: ${(e as Error)?.message || e}`);
     return { alwaysAllowed: ['skip'], users: {}, chats: {} };
   }
 }
 
 // ---------------------------------------------------------------------------
-main().catch(e => { console.error('[nanogent] fatal', e); process.exit(1); });
+// Only run main() when this file is executed directly (not when imported from
+// tests). Uses argv[1] comparison against import.meta.url.
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  main().catch(e => { console.error('[nanogent] fatal', e); process.exit(1); });
+}

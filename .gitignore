@@ -5,3 +5,5 @@ node_modules/
 .nanogent.json
 *.log
 .DS_Store
+*.tgz
+

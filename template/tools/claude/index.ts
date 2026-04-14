@@ -8,10 +8,12 @@ import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import type { ToolCtx, ToolPlugin, ToolResult } from '../../types.d.ts';
+
 const MAX_LEN = 3800;
 const EDIT_MS = 1200;
 
-export default {
+const plugin: ToolPlugin = {
   name: 'claude',
   description:
     'Send a coding task to Claude Code (runs `claude -p` in the project directory). '
@@ -39,12 +41,13 @@ export default {
     required: ['prompt', 'title'],
   },
 
-  async execute({ prompt, title }, ctx) {
-    if (ctx.busy()) {
-      const j = ctx.busy();
+  async execute(input: { prompt?: string; title?: string }, ctx: ToolCtx): Promise<ToolResult> {
+    const { prompt, title } = input;
+    const busy = ctx.busy();
+    if (busy) {
       return {
         content:
-          `error: another job is already running ('${j.title}', id=${j.jobId}). `
+          `error: another job is already running ('${busy.title}', id=${busy.jobId}). `
           + `Ask the user whether to cancel it (cancel_job) or wait for it to finish.`,
       };
     }
@@ -68,37 +71,36 @@ export default {
     ];
 
     // Create the status message we'll edit in place.
-    const first = await ctx.sendMessage(`🔧 ${title}\n⏳ starting…`);
-    const statusMsgId = first?.result?.message_id;
+    const statusHandle = await ctx.sendMessage(`🔧 ${title}\n⏳ starting…`);
 
     let acc = '';
     let finalResult = '';
     let lastEdit = 0;
-    let pendingTimer = null;
+    let pendingTimer: NodeJS.Timeout | null = null;
 
-    const render = () => {
+    const render = (): string => {
       const body = (finalResult || acc || '…').slice(-MAX_LEN);
       return `🔧 ${title}\n\n${body}`;
     };
 
-    const flush = () => {
-      if (!statusMsgId) return;
+    const flush = (): void => {
+      if (!statusHandle) return;
       const now = Date.now();
       const wait = EDIT_MS - (now - lastEdit);
       if (wait > 0) {
-        clearTimeout(pendingTimer);
+        if (pendingTimer) clearTimeout(pendingTimer);
         pendingTimer = setTimeout(flush, wait);
         return;
       }
       lastEdit = now;
-      ctx.editMessage(statusMsgId, render());
+      void ctx.editMessage(statusHandle, render());
     };
 
     const child = spawn('claude', args, { cwd: ctx.projectDir, env: process.env });
     let buffer = '';
     let cancelled = false;
 
-    child.stdout.on('data', chunk => {
+    child.stdout.on('data', (chunk: Buffer) => {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
@@ -106,13 +108,17 @@ export default {
         const trimmed = line.trim();
         if (!trimmed) continue;
         try {
-          const ev = JSON.parse(trimmed);
+          const ev = JSON.parse(trimmed) as {
+            type?: string;
+            message?: { content?: Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown> }> };
+            result?: string;
+          };
           if (ev.type === 'assistant' && ev.message?.content) {
             for (const b of ev.message.content) {
-              if (b.type === 'text') {
+              if (b.type === 'text' && b.text) {
                 acc += b.text;
               } else if (b.type === 'tool_use') {
-                acc += `\n🔧 ${b.name}(${Object.keys(b.input || {}).join(', ')})\n`;
+                acc += `\n🔧 ${b.name ?? '?'}(${Object.keys(b.input || {}).join(', ')})\n`;
               }
             }
           } else if (ev.type === 'result') {
@@ -125,13 +131,13 @@ export default {
       flush();
     });
 
-    child.stderr.on('data', d => process.stderr.write(d));
+    child.stderr.on('data', (d: Buffer) => { process.stderr.write(d); });
 
     // Promise that resolves (or rejects) when claude exits. The runtime awaits
     // this and will inject a [SYSTEM] message with whatever we return.
-    const donePromise = new Promise((resolveDone, rejectDone) => {
+    const donePromise = new Promise<string>((resolveDone, rejectDone) => {
       child.on('close', code => {
-        clearTimeout(pendingTimer);
+        if (pendingTimer) clearTimeout(pendingTimer);
         try {
           if (!hasSession) {
             mkdirSync(stateDir, { recursive: true });
@@ -140,12 +146,12 @@ export default {
               JSON.stringify({ started: new Date().toISOString() }) + '\n',
             );
           }
-        } catch {}
+        } catch { /* ignore */ }
 
         const body = (finalResult || acc).trim() || '(no output)';
         const prefix = cancelled ? '🛑 cancelled' : code === 0 ? '✅ done' : `⚠️ exit ${code}`;
-        if (statusMsgId) {
-          ctx.editMessage(statusMsgId, `${prefix}: ${title}\n\n${body.slice(-MAX_LEN)}`);
+        if (statusHandle) {
+          void ctx.editMessage(statusHandle, `${prefix}: ${title}\n\n${body.slice(-MAX_LEN)}`);
         }
 
         if (cancelled) {
@@ -158,12 +164,12 @@ export default {
         }
         resolveDone(body.slice(-2000));
       });
-      child.on('error', err => rejectDone(err));
+      child.on('error', err => { rejectDone(err); });
     });
 
-    const cancel = () => {
+    const cancel = (): void => {
       cancelled = true;
-      try { child.kill('SIGTERM'); } catch {}
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
     };
 
     ctx.backgroundJob(jobId, donePromise, cancel, { toolName: 'claude', title });
@@ -177,3 +183,5 @@ export default {
     };
   },
 };
+
+export default plugin;
