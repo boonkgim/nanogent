@@ -159,6 +159,14 @@ your-project/
       naive/                  ← default memory plugin (recent-window retrieval)
         index.ts
         README.md
+    scheduler/
+      jsonl/                  ← default scheduler plugin (optional; time-based proactive triggers)
+        index.ts
+        README.md
+    tools/
+      schedule/               ← agent-facing tool for managing schedules (inert without a scheduler)
+        index.ts
+        README.md
 ```
 
 **Your project root is untouched** — nothing nanogent-related lives outside `.nanogent/`. Teams commit `.nanogent/` as a unit to share prompt, tools, and config; runtime state stays local.
@@ -451,6 +459,60 @@ nanogent start
 - Memory indices are recoverable: drop the index, replay `append` from history, rebuild
 
 See the new READMEs at [`.nanogent/history/jsonl/`](template/history/jsonl/README.md) and [`.nanogent/memory/naive/`](template/memory/naive/README.md) for plugin-author guidance.
+
+### Migrating from 0.6.0
+
+v0.7.0 introduces an **optional** new plugin type: `scheduler`. Unlike history/memory, the runtime does not require a scheduler — projects that don't need proactive/time-based triggers can ignore everything in this section and keep running exactly as before. No config changes, no breaking changes.
+
+What v0.7.0 adds:
+
+- A new `.nanogent/scheduler/<name>/` plugin directory (zero or one active).
+- A new bundled `scheduler/jsonl` default that stores schedule definitions in `state/schedules.json` and an append-only execution log in `state/schedule-log.jsonl`.
+- A new bundled agent-facing `tools/schedule` tool with three actions (`create` / `list` / `cancel`) the agent calls conversationally.
+- A new core `fireSystemTurn` helper exposed from `nanogent.ts` — the single entry point for non-user-initiated turns. The scheduler tick loop uses it today; future webhook channels or tool completion bridges can reuse it.
+- A once-a-minute scheduler tick loop in core that runs only when a scheduler plugin is loaded.
+
+```bash
+# 1. Update nanogent
+npm install -g nanogent@latest
+
+# 2. Run the update — it drops the new scheduler/jsonl plugin and the
+#    tools/schedule agent tool, and updates the core with the new tick loop
+#    and fireSystemTurn helper. Config / contacts / prompt / existing plugins
+#    are preserved as always.
+nanogent update
+
+# 3. Restart
+nanogent start
+```
+
+**Supported schedule string formats** (all UTC — convert from the user's local wall clock before passing to the tool):
+
+| Format              | Meaning                                | Example                        |
+|---------------------|----------------------------------------|--------------------------------|
+| `once@<ISO-UTC>`    | One-shot, fires once.                  | `once@2026-04-15T18:00:00Z`    |
+| `daily@HH:MM`       | Every day at HH:MM UTC.                | `daily@08:00`                  |
+| `every@<seconds>`   | Every N seconds from creation.         | `every@3600` (hourly)          |
+
+**If you don't want scheduling**, delete the scheduler plugin directory after running `nanogent update`:
+
+```bash
+rm -rf .nanogent/scheduler
+# The tools/schedule tool stays but returns a clear "no scheduler installed"
+# error if the agent ever calls it. Or remove it too:
+rm -rf .nanogent/tools/schedule
+```
+
+**Breaking changes:** none. The runtime boots fine with zero schedulers and the core tick loop is a no-op in that state.
+
+**Philosophical notes:**
+
+- Schedules are stored under `state/`, not `config.json`. They're mutable agent-owned runtime state, not operator-authored configuration. Same category as history.
+- The definitions file and the execution log are deliberately separate. Definitions change only on explicit CRUD; the log grows monotonically as schedules fire. This mirrors the event-sourcing shape already used for history/memory.
+- Scheduler is one plugin, not two (`schedule-store` + `schedule-queue`) — the two concerns are tightly coupled and always ship together. A sqlite scheduler wants both in the same file; a redis scheduler wants both in the same keyspace.
+- The agent creates schedules conversationally through the `schedule` tool. There's no terminal command to edit schedules directly — use the chat, or edit `state/schedules.json` by hand if you really need to.
+
+See [`.nanogent/scheduler/jsonl/README.md`](template/scheduler/jsonl/README.md), [`.nanogent/tools/schedule/README.md`](template/tools/schedule/README.md), and [DESIGN.md DR-010](DESIGN.md#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source) for plugin-author guidance and the full rationale.
 
 Once running, a client just sends any text to the bot. The chat agent:
 

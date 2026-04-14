@@ -96,6 +96,14 @@ export const MANIFEST: ManifestEntry[] = [
   // Default memory plugin (indexer + retriever over the history store)
   { src: 'memory/naive/index.ts',  dest: '.nanogent/memory/naive/index.ts',  type: 'plugin' },
   { src: 'memory/naive/README.md', dest: '.nanogent/memory/naive/README.md', type: 'plugin' },
+
+  // Default scheduler plugin (proactive time-based triggers)
+  { src: 'scheduler/jsonl/index.ts',  dest: '.nanogent/scheduler/jsonl/index.ts',  type: 'plugin' },
+  { src: 'scheduler/jsonl/README.md', dest: '.nanogent/scheduler/jsonl/README.md', type: 'plugin' },
+
+  // Agent-facing schedule tool (pairs with the scheduler plugin)
+  { src: 'tools/schedule/index.ts',  dest: '.nanogent/tools/schedule/index.ts',  type: 'plugin' },
+  { src: 'tools/schedule/README.md', dest: '.nanogent/tools/schedule/README.md', type: 'plugin' },
 ];
 
 function copyFromManifest(manifest: ManifestEntry[]): void {

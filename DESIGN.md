@@ -15,6 +15,7 @@ Versions referenced:
 - **v0.4.0** — Channels and providers extracted into plugin directories. Permission model via `contacts.json`. Multi-channel, single-provider.
 - **v0.4.x → v0.5.0** — Runtime converted to TypeScript (single hand-written `.ts` file, Node 24+ type stripping).
 - **v0.5.0** — History and memory extracted into separate plugin directories. History store is the raw append-only log; memory is the indexer/retriever. Both are exactly-one-active. See [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) and [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
+- **v0.7.0** — Scheduler introduced as an optional (zero-or-one) plugin type. Time-based proactive triggers are now a first-class concern: the agent manages schedules conversationally via the bundled `schedule` tool, a core tick loop fires due schedules through the shared `fireSystemTurn` entry point, and execution state is stored as an append-only log separate from the rules file. See [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source).
 
 ## Architecture at a glance
 
@@ -27,30 +28,33 @@ Versions referenced:
   types.d.ts          — plugin contracts (shared, shipped via `init`)
   .env / .env.example — secrets (gitignored via .nanogent/.gitignore)
   .gitignore          — hides .env and /state/
-  state/              — core runtime state (jobs, learnings; history lives under its plugin)
+  state/              — core runtime state (jobs, learnings; history and schedules live under their plugins' control but under this dir)
   tools/<name>/       — plugin tools (many active)                    [v0.3.1+]
   channels/<name>/    — plugin channels (many active)                 [v0.4.0]
   providers/<name>/   — plugin AI providers (exactly one active)      [v0.4.0]
   history/<name>/     — plugin history store  (exactly one active)    [v0.5.0]
   memory/<name>/      — plugin memory system  (exactly one active)    [v0.5.0]
+  scheduler/<name>/   — plugin scheduler     (zero or one active)     [v0.7.0]
 ```
 
-Five plugin directories, five extensibility points:
+Six plugin directories, six extensibility points:
 
 | Plugin type | Directory | How many active? | What it does | Status |
 |---|---|---|---|---|
-| **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent (`claude`, `rag`, `search`, ...) | Implemented (v0.3.1) |
+| **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent (`claude`, `rag`, `search`, `schedule`, ...) | Implemented (v0.3.1) |
 | **Channel** | `channels/<name>/` | Many | Handles a transport (`telegram`, `whatsapp`, `email`, ...) | Implemented (v0.4.0) |
 | **Provider** | `providers/<name>/` | Exactly one | Implements the AI chat loop (`anthropic`, `openai`, ...) | Implemented (v0.4.0) |
 | **History store** | `history/<name>/` | Exactly one | Raw append-only message log (`jsonl`, `postgres`, ...) | Implemented (v0.5.0) |
 | **Memory** | `memory/<name>/` | Exactly one | Indexer + retriever over history (`naive`, `vector-rag`, `graphrag`, ...) | Implemented (v0.5.0) |
+| **Scheduler** | `scheduler/<name>/` | Zero or one | Stores schedule definitions + execution log; core tick fires due jobs (`jsonl`, `pg-boss`, ...) | Implemented (v0.7.0) |
 
 The asymmetry in "how many active" reflects real differences:
-- **Tools are capabilities** — a project can have several (coding, RAG, search, calendar)
+- **Tools are capabilities** — a project can have several (coding, RAG, search, calendar, schedule)
 - **Channels are ingress points** — a project can have several (DM via Telegram, email, group on WhatsApp)
 - **Providers are thinking layers** — a chat agent has one reasoning model per turn; multiplexing two providers within one conversation is confused, not a feature
 - **History is the source of truth** — one canonical log per install; multiple stores would split the truth
 - **Memory is a single lens** — the agent reasons from one context model at a time; two memories would disagree on what's relevant
+- **Scheduler is optional** — many projects never need proactive triggers. Zero is a valid state (no tick loop runs, the bundled `schedule` tool returns a clear error). One is enough — two would race on claim semantics and produce double-fires
 
 ## Core data model (v0.4.0)
 
@@ -467,6 +471,76 @@ Three design decisions worth calling out:
 - **Query for relevance ranking**: `recall(contactId, query)` passes the plain latest user text. RAG plugins use it; naive memory ignores it. Plugins should not assume `query` is the full turn context — it's just the trigger text.
 - **Not a cache**: memory is a retrieval system, not a cache of history. Two memory plugins can coexist during migration by running both and comparing, but only one is ever active in production (exactly-one rule).
 
+### DR-010: Scheduler is an optional pluggable proactive trigger source
+
+**What.** Schedules (time-based proactive triggers) are handled by an optional **scheduler plugin** under `.nanogent/scheduler/<name>/`. Zero or one scheduler is active per install — unlike history/memory, the runtime does not require a scheduler, and projects that don't need proactivity simply don't install one.
+
+The scheduler plugin owns both schedule **definitions** (the rules the agent set up) and the **execution log** (what actually fired, when, with what status). The contract:
+
+```ts
+interface SchedulerPlugin {
+  init(ctx): Promise<void>;
+
+  // Definition CRUD — called by the agent-facing `schedule` tool
+  createSchedule(spec): Promise<Schedule>;
+  listSchedules(filter?): Promise<Schedule[]>;
+  getSchedule(id): Promise<Schedule | null>;
+  deleteSchedule(id): Promise<boolean>;
+
+  // Execution — called by the core tick loop (once a minute)
+  claimDue(now, limit?): Promise<ClaimedJob[]>;
+  markComplete(jobId): Promise<void>;
+  markFailed(jobId, error): Promise<void>;
+
+  // Introspection
+  listExecutions(filter?): Promise<ScheduleExecution[]>;
+}
+```
+
+The bundled default (`scheduler/jsonl`) stores definitions in `state/schedules.json` and execution state in `state/schedule-log.jsonl` (append-only). Alternative backends (sqlite, pg-boss, redis, cloud cron bridges) can swap in without changing core or the agent-facing tool.
+
+Core owns three small pieces of plumbing that go with the plugin:
+
+1. A **`fireSystemTurn(channel, chatId, contactId, text)` helper** — the single entry point for turns that weren't initiated by a user message. It builds a synthetic trigger and injects it into the existing turn queue with `isSystemTrigger: true`, so the turn goes through the same memory recall → tool loop → channel send pipeline as any other turn. The scheduler tick loop uses it; the existing async-job completion path (pre-v0.7.0) already does the equivalent inline, and future event sources (webhooks, tool completion callbacks) should route through the same helper.
+
+2. A **scheduler tick loop** — `setInterval(60_000)` that calls `scheduler.claimDue(new Date(), 10)`, fans each returned job into `fireSystemTurn`, then calls `markComplete` (or `markFailed` if enqueueing threw). The loop is started only if a scheduler plugin is loaded; it is a no-op otherwise. One tick fires immediately on boot so schedules that came due while the process was down get picked up right away (subject to the plugin's own missed-fire policy).
+
+3. A **`scheduler` field on `ToolCtx`** — so the bundled `schedule` tool (and any future scheduling-aware tool) can reach the active plugin via `ctx.scheduler`. Null if no scheduler is installed.
+
+**Why.**
+
+- **Proactivity is real demand, plugin shape is speculative.** Many nanogent deployments want "run this at 8am" — that's a concrete use case. But "how should the schedule queue work" has genuine implementation variance: in-process jsonl, sqlite, durable queues like pg-boss, external cron bridges. Hardcoding one choice would either ship over-engineered defaults or box in users who need durability guarantees. A plugin seam lets the default be as simple as jsonl while leaving the door open for substitution. Designing the contract from core's actual call sites (CRUD + claim/complete/fail) kept the interface to ten methods — small enough to be worth having, large enough to be meaningful.
+
+- **Definitions and execution state are tightly coupled.** Unlike history/memory (where memory is a *derived projection* that can legitimately be swapped independently), a scheduler's rules and its execution log always ship together: a sqlite scheduler wants both in the same db file, a redis scheduler wants both in the same keyspace, and swapping one without the other would leave orphan claims or unresolvable references. So scheduler is **one plugin**, not two (`schedule-store` + `schedule-queue`) — splitting them would be speculative pluggability nobody would use.
+
+- **The definitions file is a clean source of truth; per-fire state is append-only.** Inside the default jsonl plugin, `state/schedules.json` holds only the rules (what the agent CRUDs), and `state/schedule-log.jsonl` holds every fire attempt (claimed / completed / failed). This mirrors the event-sourcing shape already used for history/memory: the definitions file changes only on explicit CRUD, the log grows monotonically as schedules fire. Retry policy, last-fired tracking, and execution history all derive from the log without mutating the rules file.
+
+- **Zero is a valid state.** Requiring a scheduler would force every nanogent install to ship one — wasted bytes for projects that never use proactivity. Making it optional lets operators opt in by dropping `scheduler/jsonl/` into `.nanogent/` (which `nanogent init` does by default, but `nanogent update` respects the user's choice if they remove it).
+
+- **Agent-initiated, not config-file-initiated.** Schedules are conversational: "remind me every morning at 8". That implies the agent creates them through a tool call rather than the operator editing config files from a terminal. Schedule state therefore lives under `state/` (mutable runtime state the agent owns), not `config.json` (operator-owned). This matches how history files are handled — same category of data.
+
+- **The scheduler plugin is NOT the right primitive for user-initiated turns or async tool dispatch.** Both tempting unifications are wrong. Routing user messages through the scheduler queue would add latency to the conversational hot path for no benefit. Routing async tool jobs through the scheduler would conflate "this turn has background work" (a per-turn concern with ephemeral semantics) with "this schedule needs to fire later" (a persistent, restart-safe concern). The shared primitive is `fireSystemTurn`, not the scheduler — schedules, async tool completions, and future webhook events all *use* `fireSystemTurn` to inject a turn, but they don't share state, lifecycle, or retry semantics.
+
+**Consequences.**
+
+- **`claimDue` atomicity is the one semantically loaded operation.** The contract promise is: "a claimed job will not be returned by a second `claimDue` call until `markComplete` or `markFailed` runs." The jsonl default achieves this via a `claimed` log entry; a SQL backend would use `SELECT ... FOR UPDATE SKIP LOCKED`; a redis backend would use `BRPOPLPUSH`. Core doesn't care how — it just calls the method.
+
+- **Orphan claim recovery is the plugin's responsibility.** If a previous process crashed between `claimed` and `markComplete`, the scheduleId could stay in "in-flight" forever. The jsonl default handles this on `init()` by scanning the log for orphan claims and fail-forwarding them with `error: orphan-crash-recovery`. Alternative backends must implement equivalent logic — the core doesn't retry, re-claim, or replay on its behalf.
+
+- **Retry policy is plugin-scoped, not core-scoped.** Core does not retry failed fires. If a scheduler plugin wants retries (e.g., "if a turn fails, re-queue with exponential backoff"), it does so internally — its `markFailed` implementation can append a new due-at record and `claimDue` will pick it up on the next tick. The default jsonl plugin does **not** implement retries: a failed fire is recorded as `failed` and the schedule becomes eligible again on its next computed time. This is intentional — retrying a scheduled agent turn is semantically ambiguous (does the agent want to see "I'm retrying because the last run failed" in history, or should it be invisible?), and cheap to add per-backend when a real requirement appears.
+
+- **Missed-fire policy is plugin-scoped.** If the process is down for two hours, a `daily@08:00` schedule that should have fired once during that window could be replayed on boot (once, to catch up) or silently dropped (treat the window as lost). The jsonl default fires it once on boot tick because computeNextFire returns a past time — which the tick loop treats as due. A durable backend might implement exactly-once semantics or sliding windows. Plugin authors should document their choice.
+
+- **`fireSystemTurn` is the only new core export.** Everything else the scheduler plugin needs already exists: the turn queue, `processTrigger`'s `isSystemTrigger` branch that recomputes effective tools for non-user triggers, the channel send pipeline. The scheduler is a small addition precisely because the runtime already had the shape it needed.
+
+- **System prompt contextualization is the agent's responsibility.** When a scheduled turn fires, the trigger text is prefixed `[SCHEDULED "<name>"] <prompt>` so the agent can recognize it's responding to a scheduled event rather than a live user message. Plugin authors writing alternative schedulers should preserve this prefix pattern or document their own convention — the agent relies on it to adjust tone and phrasing.
+
+- **`schedule` tool is bundled but inert without a scheduler.** The agent-facing `schedule` tool ships as a default in `tools/schedule/` because scheduling is a common-enough capability that making it a first-class default beats making users hunt for it. If no scheduler plugin is installed, every call to the tool returns a clear error pointing at `.nanogent/scheduler/`. This matches the pattern of installing capability-first and letting operators disable what they don't want.
+
+- **Time zones are punted to the agent.** The default jsonl scheduler stores `daily@HH:MM` in UTC. The agent is responsible for converting the user's local wall clock to UTC before calling `schedule_create`. A richer `daily@HH:MM@<tz>` format is a future extension that plugin authors can add independently.
+
+- **Per-contact execution serialization is unchanged.** The existing global `turnQueue` already serializes all turns (user + system + scheduled) across the entire process, so scheduler fires cannot race with live user messages or async job completions. A future per-contact serializer (allowing cross-contact parallelism) would not change the scheduler — it still just enqueues via `fireSystemTurn`.
+
 ---
 
 ## Guidance for plugin authors
@@ -536,6 +610,25 @@ Read [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-his
 - [ ] Log errors but don't throw — the core treats memory failures as recoverable (index can always be rebuilt from history)
 - [ ] Keep plugin-local state under `<plugin-dir>/state/` and namespace by `contactId`
 
+### Writing a scheduler plugin (v0.7.0+)
+
+Read [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source) first.
+
+**Checklist:**
+
+- [ ] Implement the full `SchedulerPlugin` contract: `init`, `createSchedule`, `listSchedules`, `getSchedule`, `deleteSchedule`, `claimDue`, `markComplete`, `markFailed`, `listExecutions`
+- [ ] Honour the `claimDue` atomicity promise: a claimed job must not be returned by a second `claimDue` call until `markComplete` or `markFailed` has run. For jsonl, this means writing a `claimed` log entry synchronously before returning. For SQL, this means `SELECT ... FOR UPDATE SKIP LOCKED` or equivalent. For redis, `BRPOPLPUSH` or equivalent.
+- [ ] Keep the definitions file (or equivalent table) and the execution log separate concerns in your backend. Definitions change only on CRUD; the log grows monotonically. Do not mutate an existing execution record to reflect a status change — append a new one. This matches event-sourcing semantics and makes restart recovery trivial.
+- [ ] Implement orphan claim recovery on `init`. Scan your in-flight state for `claimed` records with no matching `completed`/`failed` and decide (a) fail-forward them with a descriptive error, or (b) re-issue them on the next `claimDue`. The default jsonl plugin fails them forward — document whichever choice you make.
+- [ ] Document your schedule string format in your plugin's README. The bundled jsonl default supports `once@<ISO-UTC>`, `daily@HH:MM`, `every@<seconds>`. You are free to invent your own — cron expressions, natural-language intervals, calendar integrations — as long as the agent can generate valid strings from its system prompt or the tool description teaches the format.
+- [ ] Reject invalid schedule strings eagerly in `createSchedule` (throw, don't silently store). A schedule that never fires because the format was wrong is a very frustrating failure mode to debug.
+- [ ] `getSchedule`, `listSchedules`, `listExecutions` are read-only — do not mutate state in them.
+- [ ] If you implement retries, implement them inside the plugin (e.g., `markFailed` re-enqueues the schedule with a delayed next-fire). Core does not retry. Document your retry policy in the README.
+- [ ] Document your missed-fire policy: when the process was down through a scheduled time, do you fire once on boot (catch-up), drop silently, or replay every missed instance in order? The jsonl default fires once on boot.
+- [ ] Keep plugin state under `ctx.stateDir` and do not hardcode paths outside it. The core's `/state/` gitignore covers this dir by default.
+- [ ] Treat `contactId`, `channel`, and `chatId` on `ScheduleSpec` as opaque strings — they're routing metadata, not schedule identity. Do not parse them.
+- [ ] Log failures but don't throw out of methods that the core calls in a tight loop (`claimDue` especially). A scheduler plugin that throws every tick will just spam logs; one that logs and returns an empty result degrades gracefully.
+
 ### Email plugin — specific guidance
 
 See [DR-004](#dr-004-email-channel-should-use-per-thread-chatids-with-shared-history). Quick summary:
@@ -571,5 +664,6 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 
 - **0.1 (2026-04-14)** — Initial draft capturing decisions from the v0.4.0 design discussion. Channels and providers as plugins; permission model via `contacts.json`; email guidance; historyMode semantics.
 - **0.2 (2026-04-14)** — Added DR-009a (history storage is a separate pluggable raw log) and DR-009b (memory is a separate pluggable indexer/retriever). Captures the v0.5.0 split of history and memory into two exactly-one-active plugin directories, the recall/append/retractLast/clear contract, `systemContext` in `RecallResult`, cache-control placement guidance, and the "history is source of truth, memory is recoverable" consistency model.
+- **0.3 (2026-04-15)** — Added DR-010 (scheduler is an optional pluggable proactive trigger source). Captures the v0.7.0 introduction of an optional zero-or-one scheduler plugin type, the 9-method `SchedulerPlugin` contract (definition CRUD + claimDue/markComplete/markFailed + listExecutions), the core-owned `fireSystemTurn` helper as the single entry point for non-user-initiated turns, the once-a-minute tick loop, the definitions-vs-execution-log split in the bundled `scheduler/jsonl` default, and the rationale for keeping definitions/execution in a single plugin while keeping the scheduler itself optional.
 
 When adding a new decision or updating an existing one, add a line here with the date and a one-sentence summary.
