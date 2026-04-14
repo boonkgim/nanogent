@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { copyFileSync, existsSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -11,43 +11,64 @@ const here = dirname(fileURLToPath(import.meta.url));
 const tplDir = join(here, '..', 'template');
 
 const usage = `
-nanogent — per-project Telegram ↔ Claude Code bridge
+nanogent — per-project chat agent with pluggable tools, reachable via Telegram
 
-  nanogent init             copy nanogent.mjs + .env.example into the current folder
-  nanogent init --docker    also copy Dockerfile + docker-compose.yml
-  nanogent start            run the listener in the current folder (node)
+  nanogent init             drop nanogent.mjs + default tool + prompt + .env.example
+  nanogent init --docker    also drop Dockerfile + docker-compose.yml
+  nanogent start            run the listener (node)
   nanogent start --docker   run the listener in a docker container
 
 after init:
   1. cp .env.example .env
-  2. fill TELEGRAM_BOT_TOKEN (from @BotFather) and TELEGRAM_ALLOWED_CHAT_IDS
-  3. nanogent start            (or: node nanogent.mjs)
-     nanogent start --docker   (or: docker compose up -d)
+  2. fill TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, ANTHROPIC_API_KEY
+  3. edit .nanogent-prompt.md for this project / client
+  4. nanogent start            (or: node nanogent.mjs)
+     nanogent start --docker   (or: docker compose up -d --build)
 
-in-chat commands (once running):
-  /status   show the running job and queue depth
-  /cancel   SIGTERM the running job
-  /queue    list running + queued prompts
-  /clear    forget current session — next message starts fresh
+in-chat (once running):
+  any text    → routed through the chat agent, which may delegate to tools
+  /status     current background job
+  /cancel     cancel running job
+  /clear      wipe chat history
+  /help       show command list
 
 to stop:  Ctrl+C   (or: kill <pid> / pm2 stop / docker compose down)
-to remove: rm nanogent.mjs .nanogent.json .env [Dockerfile docker-compose.yml]
+to remove: rm -rf nanogent.mjs .nanogent .nanogent-prompt.md .env [Dockerfile docker-compose.yml]
 `;
 
-const baseFiles = ['nanogent.mjs', '.env.example'];
-const dockerFiles = ['Dockerfile', 'docker-compose.yml'];
+/**
+ * Manifest: template source path → destination path (relative to cwd).
+ * Some destinations rename (e.g. template/nanogent-prompt.md → .nanogent-prompt.md).
+ */
+const BASE_MANIFEST = [
+  { src: 'nanogent.mjs',       dest: 'nanogent.mjs' },
+  { src: '.env.example',       dest: '.env.example' },
+  { src: 'nanogent-prompt.md', dest: '.nanogent-prompt.md' },
+  { src: 'tools/claude.mjs',   dest: '.nanogent/tools/claude.mjs' },
+];
 
-if (cmd === 'init') {
-  const files = docker ? [...baseFiles, ...dockerFiles] : baseFiles;
-  for (const f of files) {
-    const dest = join(process.cwd(), f);
-    if (existsSync(dest)) {
-      console.log(`skip (exists): ${f}`);
+const DOCKER_MANIFEST = [
+  { src: 'Dockerfile',         dest: 'Dockerfile' },
+  { src: 'docker-compose.yml', dest: 'docker-compose.yml' },
+];
+
+function copyFromManifest(manifest) {
+  for (const { src, dest } of manifest) {
+    const from = join(tplDir, src);
+    const to = join(process.cwd(), dest);
+    if (existsSync(to)) {
+      console.log(`skip (exists): ${dest}`);
       continue;
     }
-    copyFileSync(join(tplDir, f), dest);
-    console.log(`created:       ${f}`);
+    mkdirSync(dirname(to), { recursive: true });
+    copyFileSync(from, to);
+    console.log(`created:       ${dest}`);
   }
+}
+
+if (cmd === 'init') {
+  const manifest = docker ? [...BASE_MANIFEST, ...DOCKER_MANIFEST] : BASE_MANIFEST;
+  copyFromManifest(manifest);
   const next = docker
     ? '\nnext: cp .env.example .env && nanogent start --docker'
     : '\nnext: cp .env.example .env && nanogent start';
