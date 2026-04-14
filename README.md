@@ -198,6 +198,28 @@ done
 
 Your chat history, learnings, prompt, and config are unaffected.
 
+### Migrating from 0.3.1
+
+v0.3.2 tightens the separation between core state and tool state. The core's top-level `.gitignore` now anchors its `state/` rule with a leading slash (`/state/`), so it no longer reaches into tool directories. The default `claude` tool's session marker moves from `.nanogent/state/claude-session.marker` (core state dir) to `.nanogent/tools/claude/state/session.marker` (tool-scoped state), and the tool now ships its own `.gitignore` to hide it.
+
+Optional migration steps (everything works without them — your first claude run after upgrading will just start a fresh session):
+
+```bash
+# preserve the existing claude session (optional)
+mkdir -p .nanogent/tools/claude/state
+[ -f .nanogent/state/claude-session.marker ] && \
+  mv .nanogent/state/claude-session.marker .nanogent/tools/claude/state/session.marker
+
+# re-run init to drop the new top-level gitignore + tool gitignore
+# (won't overwrite existing files; see `skip (exists)` in output)
+npx nanogent init
+
+# update the top-level gitignore manually (init skips the existing one):
+# change `state/` to `/state/` in .nanogent/.gitignore
+```
+
+Chat history, learnings, prompt, config, and tool code are otherwise unaffected.
+
 Once running, a client just sends any text to the bot. The chat agent:
 
 1. Decides whether the message is addressed to it (calls `skip` if not)
@@ -301,6 +323,36 @@ What `ctx` provides:
 | `ctx.log(...)` | Scoped logger |
 
 Tools are discovered at startup by scanning `.nanogent/tools/` for directories. Each directory must contain an `index.mjs` that default-exports `{ name, description, input_schema, execute }` — if the file is missing or the shape is wrong, the tool is skipped with a log line. Directories starting with `_` are ignored (scratch / wip space). No manifest, no config file, no naming rules beyond `index.mjs` — drop a folder, restart, it's loaded.
+
+### State & persistence
+
+Each tool owns its own directory under `.nanogent/tools/<name>/`. **That includes any state the tool wants to persist** — caches, indexes, session markers, whatever. The convention (not enforcement) is to put it under `ctx.toolDir/state/`:
+
+```js
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+async execute(input, ctx) {
+  const stateDir = join(ctx.toolDir, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, 'cache.json'), JSON.stringify(data));
+  // ...
+}
+```
+
+**Core does not dictate what tools commit or ignore.** Nanogent's top-level `.nanogent/.gitignore` only hides things the core owns:
+
+- `.env` (at any depth) — safety default; any `.env` file anywhere under `.nanogent/` is treated as secret
+- `/state/` (anchored with a leading slash) — the core runtime's own state directory only
+
+That anchored `/state/` rule does **not** reach into `.nanogent/tools/<name>/state/`. Whether your tool's state is committed is entirely your tool's decision:
+
+- **Tool wants its state committed** (e.g. a RAG tool with a pre-built index that took hours to build and the team should share): ship no `.gitignore`, or a `.gitignore` that explicitly un-ignores `state/`.
+- **Tool wants its state hidden** (e.g. per-machine session markers, temporary caches): ship a `.gitignore` inside the tool's folder, e.g. `.nanogent/tools/<name>/.gitignore` containing `state/`.
+
+The default `claude` tool is the second case — it ships `.nanogent/tools/claude/.gitignore` with `state/` so its session marker isn't committed. Read it as a reference if you're writing a new tool.
+
+**Nothing about core changes when you add a tool with state.** No new config, no registration, no opt-in. `ctx.toolDir` is always defined, `mkdir + write` is all the API you need, and the gitignore story is the tool's problem.
 
 ## How it works
 

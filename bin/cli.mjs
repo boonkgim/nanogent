@@ -54,6 +54,7 @@ const MANIFEST = [
   { src: 'docker-compose.yml', dest: '.nanogent/docker-compose.yml' },
   { src: 'tools/claude/index.mjs', dest: '.nanogent/tools/claude/index.mjs' },
   { src: 'tools/claude/README.md', dest: '.nanogent/tools/claude/README.md' },
+  { src: 'tools/claude/gitignore', dest: '.nanogent/tools/claude/.gitignore' },  // same npm-strips-.gitignore workaround
 ];
 
 function copyFromManifest(manifest) {

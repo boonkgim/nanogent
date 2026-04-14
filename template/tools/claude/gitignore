@@ -1,0 +1,9 @@
+# claude tool's own gitignore. Nanogent's top-level gitignore does NOT
+# reach into tool directories (except for the .env safety default), so
+# tools that want to hide their own state must declare it themselves.
+#
+# The claude tool's `state/` holds a session marker that gates Claude Code's
+# `--continue` flag. It's per-machine / per-install and not meaningful to
+# commit — same class as .nanogent/state/ at the top level.
+
+state/

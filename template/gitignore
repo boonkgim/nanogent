@@ -1,6 +1,14 @@
-# nanogent — local secrets + runtime state. Everything else in this
-# directory (nanogent.mjs, config.json, prompt.md, tools/, Dockerfile,
+# nanogent top-level gitignore. Everything else in .nanogent/
+# (nanogent.mjs, config.json, prompt.md, tools/, Dockerfile,
 # docker-compose.yml) is safe to commit so the team can share it.
 
+# Safety default: any file named .env under .nanogent/ is a secret file,
+# regardless of whether it belongs to core or to a tool. Never commit one.
 .env
-state/
+
+# Core runtime state only — history, jobs, learnings.
+# The leading slash anchors this to .nanogent/, so tool state directories
+# (.nanogent/tools/<name>/state/) are NOT matched by this rule. Each tool
+# manages its own state and ships its own .gitignore if it wants anything
+# in its folder ignored.
+/state/

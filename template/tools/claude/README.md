@@ -32,10 +32,20 @@ rm -rf .nanogent/tools/claude
 
 Restart nanogent and the tool is gone. The chat agent will continue to work (with whatever other tools remain, or none at all — small talk, learnings, and status still work).
 
+## State
+
+This tool persists a single file — a session marker — to gate Claude Code's `--continue` flag. It lives under the tool's own folder:
+
+```
+.nanogent/tools/claude/state/session.marker
+```
+
+The adjacent `.gitignore` (`.nanogent/tools/claude/.gitignore`) hides `state/` so the marker isn't committed. Nanogent's top-level gitignore does **not** reach into tool directories, so this file's ignore rule is the tool's own responsibility. Delete the marker to force a fresh claude session on the next run (same effect as nanogent's `/clear` slash command).
+
 ## Customising
 
 Open `.nanogent/tools/claude/index.mjs` — it's self-contained (imports only from node stdlib and talks to the injected `ctx`). Edit it in place. Common tweaks:
 
 - **Different `claude` flags** — e.g. remove `--dangerously-skip-permissions` if you want permission prompts on the host (only useful when running without docker).
 - **Different output format** — the current parser is tuned for `stream-json`; if you prefer the plain streaming output, change the args and drop the `stream-json` parser.
-- **Session scope** — the session marker file at `.nanogent/state/claude-session.marker` gates `--continue`. Delete it to force a fresh session on the next run (same as the `/clear` slash command on nanogent's side).
+- **Session scope** — delete `state/session.marker` to force a fresh session on the next run.

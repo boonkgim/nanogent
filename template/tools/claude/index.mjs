@@ -6,9 +6,8 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { join } from 'node:path';
 
-const SESSION_MARKER = '.nanogent/state/claude-session.marker';
 const MAX_LEN = 3800;
 const EDIT_MS = 1200;
 
@@ -54,7 +53,12 @@ export default {
     }
 
     const jobId = ctx.newJobId();
-    const hasSession = existsSync(SESSION_MARKER);
+    // Tool-scoped state: the session marker lives inside this tool's own folder,
+    // not in the core `.nanogent/state/` directory. Core's gitignore does not
+    // reach here — the tool ships its own .gitignore to hide `state/`.
+    const stateDir = join(ctx.toolDir, 'state');
+    const sessionMarker = join(stateDir, 'session.marker');
+    const hasSession = existsSync(sessionMarker);
     const args = [
       '-p', prompt,
       '--output-format', 'stream-json',
@@ -130,9 +134,9 @@ export default {
         clearTimeout(pendingTimer);
         try {
           if (!hasSession) {
-            mkdirSync(dirname(SESSION_MARKER), { recursive: true });
+            mkdirSync(stateDir, { recursive: true });
             writeFileSync(
-              SESSION_MARKER,
+              sessionMarker,
               JSON.stringify({ started: new Date().toISOString() }) + '\n',
             );
           }
