@@ -37,6 +37,7 @@ const MAX_MSG = 3900;
 const STATE_DIR = '.nanogent/state';
 const HISTORY_PATH = `${STATE_DIR}/history.jsonl`;
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
+const JOBS_PATH = `${STATE_DIR}/jobs.json`;
 const PROMPT_PATH = '.nanogent-prompt.md';
 const TOOLS_DIR = '.nanogent/tools';
 
@@ -84,10 +85,40 @@ function loadHistory() {
   }
 }
 
-function saveHistory() {
-  if (history.length > MAX_HISTORY) {
-    history = history.slice(-MAX_HISTORY);
+/**
+ * A history entry is a safe "turn start" if we can make it the first message
+ * sent to the Anthropic API without producing an orphan tool_result. That is:
+ *   - role must be 'user'
+ *   - content must contain at least one non-tool_result block (or be a string)
+ */
+function isTurnStart(message) {
+  if (message.role !== 'user') return false;
+  if (typeof message.content === 'string') return true;
+  if (!Array.isArray(message.content)) return false;
+  return !message.content.some(b => b?.type === 'tool_result');
+}
+
+/**
+ * Boundary-aware rotation. Naive slice(-MAX_HISTORY) can cut through a
+ * tool_use/tool_result pair and leave an orphan tool_result at the head,
+ * which the API rejects. We scan forward from the naive cut point until we
+ * hit a valid turn start; if none is found in the window, we walk backward
+ * from the end to find the latest safe start.
+ */
+function rotateHistory() {
+  if (history.length <= MAX_HISTORY) return;
+  const minStart = history.length - MAX_HISTORY;
+  for (let i = minStart; i < history.length; i++) {
+    if (isTurnStart(history[i])) { history = history.slice(i); return; }
   }
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (isTurnStart(history[i])) { history = history.slice(i); return; }
+  }
+  history = [];
+}
+
+function saveHistory() {
+  rotateHistory();
   writeFileSync(HISTORY_PATH, history.map(h => JSON.stringify(h)).join('\n') + '\n');
 }
 
@@ -129,8 +160,57 @@ function newJobId() {
   return randomUUID().slice(0, 8);
 }
 
+function persistActiveJob() {
+  try {
+    if (activeJob) {
+      writeFileSync(JOBS_PATH, JSON.stringify({
+        jobId:     activeJob.jobId,
+        toolName:  activeJob.toolName,
+        title:     activeJob.title,
+        startedAt: activeJob.startedAt,
+      }) + '\n');
+    } else {
+      try { unlinkSync(JOBS_PATH); } catch {}
+    }
+  } catch (e) {
+    log('job persist error', e?.message || e);
+  }
+}
+
+/**
+ * On boot, if jobs.json still references an active job, the process died while
+ * it was running. The child process and its promise are gone forever — any file
+ * changes the tool made before the crash are still on disk, but we have no
+ * output. Inject a synthetic [SYSTEM] user message so the chat agent can
+ * acknowledge the interruption the next time the client messages.
+ */
+function recoverInterruptedJob() {
+  if (!existsSync(JOBS_PATH)) return;
+  let stale;
+  try {
+    stale = JSON.parse(readFileSync(JOBS_PATH, 'utf8'));
+  } catch {
+    try { unlinkSync(JOBS_PATH); } catch {}
+    return;
+  }
+  try { unlinkSync(JOBS_PATH); } catch {}
+  if (!stale?.jobId) return;
+  const elapsed = Math.round((Date.now() - (stale.startedAt || Date.now())) / 1000);
+  log(`recovered interrupted job: ${stale.jobId} (${stale.toolName}, "${stale.title}", ~${elapsed}s old)`);
+  history.push({
+    role: 'user',
+    content:
+      `[SYSTEM] Tool '${stale.toolName}' (job ${stale.jobId}, "${stale.title}") was INTERRUPTED `
+      + `by a restart after ~${elapsed}s. The job's final status is unknown — any file changes `
+      + `it made before the restart are on disk, but we don't have its output. If the user asks `
+      + `about it, acknowledge the interruption and offer to retry.`,
+  });
+  saveHistory();
+}
+
 function registerJob({ jobId, toolName, title, cancel, promise }) {
   activeJob = { jobId, toolName, title, startedAt: Date.now(), cancel };
+  persistActiveJob();
   promise.then(
     result => onJobComplete(jobId, 'completed', result),
     err    => onJobComplete(jobId, 'failed', err?.message || String(err)),
@@ -142,6 +222,7 @@ async function onJobComplete(jobId, status, result) {
   const { toolName, title, startedAt } = activeJob;
   const elapsed = Math.round((Date.now() - startedAt) / 1000);
   activeJob = null;
+  persistActiveJob();
   // Inject synthetic system message, queue a turn so the chat agent responds.
   const body = typeof result === 'string' ? result : JSON.stringify(result);
   enqueueTurn({
@@ -208,11 +289,17 @@ async function loadTools() {
 }
 
 function toolSchemas() {
-  return [...tools.values()].map(t => ({
+  const arr = [...tools.values()].map(t => ({
     name: t.name,
     description: t.description,
     input_schema: t.input_schema,
   }));
+  // Cache the entire tool definitions block — stable across turns within a
+  // session. `cache_control` on the last tool marks the cache breakpoint.
+  if (arr.length > 0) {
+    arr[arr.length - 1].cache_control = { type: 'ephemeral' };
+  }
+  return arr;
 }
 
 /** Returns tool_result content (string) or { skip: true } for the 'skip' core tool. */
@@ -263,14 +350,22 @@ function coreLearn({ title, content }) {
 // Chat agent turn (Anthropic API loop)
 // ---------------------------------------------------------------------------
 
+/**
+ * System prompt is returned as structured blocks so we can cache the stable
+ * base prompt and leave the dynamic tail (learnings, current job state)
+ * uncached. `cache_control` on the base block marks the cache breakpoint.
+ */
 function buildSystemPrompt() {
-  let base = existsSync(PROMPT_PATH) ? readFileSync(PROMPT_PATH, 'utf8') : DEFAULT_SYSTEM_PROMPT;
+  const base = existsSync(PROMPT_PATH) ? readFileSync(PROMPT_PATH, 'utf8') : DEFAULT_SYSTEM_PROMPT;
   const learnings = loadLearnings();
   const jobState = activeJob
     ? `\n\n## Current state\nA background job is running: "${activeJob.title}" (tool=${activeJob.toolName}, id=${activeJob.jobId}). You should NOT start another job of the same kind — ask the user or call check_job_status.`
     : '';
   const learnSection = learnings.trim() ? `\n\n${learnings.trim()}` : '';
-  return `${base}${learnSection}${jobState}`;
+  const dynamic = `${learnSection}${jobState}`;
+  const blocks = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
+  if (dynamic) blocks.push({ type: 'text', text: dynamic });
+  return blocks;
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are a friendly project assistant talking to a client via Telegram. You have access to tools for doing actual work — prefer calling them over making things up. If a message is side chatter not addressed to you, call skip.`;
@@ -470,6 +565,7 @@ let offset = 0;
 
 async function main() {
   await loadTools();
+  recoverInterruptedJob();
   log(`listening in ${process.cwd()} (model=${CHAT_MODEL}, ${tools.size} tools: ${[...tools.keys()].join(', ')})`);
   process.on('SIGINT', () => { log('bye'); process.exit(0); });
 
