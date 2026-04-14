@@ -9,9 +9,9 @@
 // memory plugin's job (see .nanogent/memory/).
 
 import {
-  existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 
 import type {
   HistoryMessage, HistoryStoreCtx, HistoryStorePlugin,
@@ -43,11 +43,20 @@ function loadFromDisk(contactId: string): HistoryMessage[] {
   return h;
 }
 
-function flushToDisk(contactId: string): void {
+function serialize(messages: HistoryMessage[]): string {
+  return messages.map(m => JSON.stringify(m)).join('\n') + '\n';
+}
+
+// Full rewrite — only used by retractLast/clear, where we actually need to
+// drop bytes from the file. Never called from the append hot path.
+function rewriteOnDisk(contactId: string): void {
   const h = cache.get(contactId) || [];
   const p = pathFor(contactId);
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, h.map(m => JSON.stringify(m)).join('\n') + (h.length ? '\n' : ''));
+  if (h.length === 0) {
+    try { unlinkSync(p); } catch { /* ignore */ }
+    return;
+  }
+  writeFileSync(p, serialize(h));
 }
 
 const plugin: HistoryStorePlugin = {
@@ -61,10 +70,14 @@ const plugin: HistoryStorePlugin = {
 
   async append(contactId: string, messages: HistoryMessage[]): Promise<void> {
     if (messages.length === 0) return;
+    // Keep the in-memory cache warm so subsequent reads are O(1), and write
+    // ONLY the new lines to disk — never rewrite the full file. With rotation
+    // moved into the memory plugin, histories grow without bound; a full
+    // rewrite on every turn would be O(n) in total history size.
     const h = loadFromDisk(contactId);
     h.push(...messages);
     cache.set(contactId, h);
-    flushToDisk(contactId);
+    appendFileSync(pathFor(contactId), serialize(messages));
   },
 
   async read(contactId: string, opts?: { limit?: number }): Promise<HistoryMessage[]> {
@@ -81,12 +94,12 @@ const plugin: HistoryStorePlugin = {
     const h = loadFromDisk(contactId);
     if (count >= h.length) {
       cache.set(contactId, []);
-      flushToDisk(contactId);
+      rewriteOnDisk(contactId);
       return;
     }
     h.splice(h.length - count, count);
     cache.set(contactId, h);
-    flushToDisk(contactId);
+    rewriteOnDisk(contactId);
   },
 
   async clear(contactId: string): Promise<void> {
