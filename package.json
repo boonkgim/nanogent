@@ -14,5 +14,14 @@
     "node": ">=18"
   },
   "keywords": ["claude", "claude-code", "telegram", "bot", "agent", "nanogent"],
-  "license": "MIT"
+  "author": "Khur Boon Kgim",
+  "license": "MIT",
+  "homepage": "https://github.com/boonkgim/nanogent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boonkgim/nanogent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/boonkgim/nanogent/issues"
+  }
 }
