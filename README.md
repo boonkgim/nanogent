@@ -42,7 +42,7 @@ Anthropic's [Claude Code Channels](https://code.claude.com/docs/en/channels) pus
 | Model | MCP plugin → running Claude Code session | Standalone chat agent → tools (one of which may be `claude`) |
 | Requires a live Claude Code session? | **Yes** | No — spawns `claude -p` on demand via the `claude` tool |
 | Permission prompts | **Pause remotely** | Bypassed via `--dangerously-skip-permissions` (allowlist gated) |
-| Deployable on a VPS / Raspberry Pi / headless box? | Awkward | Yes — `pm2 start nanogent.ts` or `docker compose up -d` |
+| Deployable on a VPS / Raspberry Pi / headless box? | Awkward | Yes — `docker compose up -d` |
 | Client-facing? | Developer-only | Yes — chat agent handles small talk, skipping, clarification |
 | Extensibility | MCP servers | Drop-in folder tools per project |
 | Moving parts | MCP server + pairing codes + session | One `.ts` runtime + per-tool folders + `.env` |
@@ -104,23 +104,24 @@ No tool manifests, no versioning fields, no registration files, no helper librar
 
 ## Requirements
 
-- Node.js ≥ 18 (uses global `fetch`)
+- **Docker** — `docker` and `docker compose` on PATH. Nanogent always runs the listener inside a container so plugin dependencies stay isolated from the host project.
+- **Node.js ≥ 24** on the host for the CLI itself (`nanogent init`, `nanogent build`, `nanogent update`). The runtime inside the container ships its own Node.
 - An Anthropic API key from [console.anthropic.com](https://console.anthropic.com) (for the chat agent itself)
-- If you keep the default `claude` tool: [`claude` CLI](https://docs.claude.com/claude-code) installed and authenticated (`claude --version` should work)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram chat ID — message [@userinfobot](https://t.me/userinfobot) to get it
+- If you keep the default `claude` tool: run `claude` on the host once to complete the login flow so `~/.claude` exists. The container bind-mounts it for auth.
 
 ## Install & run
 
-One command drops everything into a single `.nanogent/` directory — your project root stays untouched. Node is the default; docker is a config flip, not a separate install.
+One command drops everything into a single `.nanogent/` directory — your project root stays untouched. Docker is the only runtime; `nanogent start` hands off to `docker compose up --build`.
 
 ```bash
 cd your-project
-npx nanogent init                        # drops .nanogent/ with all plugin folders
-cp .nanogent/.env.example .nanogent/.env  # fill in TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
-$EDITOR .nanogent/contacts.json           # add yourself as operator with your Telegram chatId
-$EDITOR .nanogent/prompt.md               # tailor the system prompt for this project / client
-nanogent start                            # reads .nanogent/config.json to choose node or docker mode
+npx nanogent init                         # drops .nanogent/ with all plugin folders and builds Dockerfile.generated
+cp .nanogent/.env.example .nanogent/.env   # fill in TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
+$EDITOR .nanogent/contacts.json            # add yourself as operator with your Telegram chatId
+$EDITOR .nanogent/prompt.md                # tailor the system prompt for this project / client
+nanogent start                             # docker compose up --build
 ```
 
 What lands in your project:
@@ -130,12 +131,12 @@ your-project/
   .nanogent/
     nanogent.ts               ← core runtime (readable, auditable, committed)
     types.d.ts                ← shared plugin contract types — committed
-    config.json               ← non-secret settings (projectName, docker, chatModel) — committed
+    config.json               ← non-secret settings (projectName, chatModel, maxTokens) — committed
     contacts.json             ← access control + identity map — committed
     prompt.md                 ← system prompt — committed
     Dockerfile                ← base image (FROM / apt) — committed
     Dockerfile.generated      ← produced by `nanogent build` (base + plugin install.sh) — gitignored
-    docker-compose.yml        ← builds from Dockerfile.generated; inert unless config.docker=true
+    docker-compose.yml        ← what `nanogent start` builds and runs — committed
     .env.example              ← template for secrets — committed
     .env                      ← actual secrets — gitignored via .nanogent/.gitignore
     .gitignore                ← hides .env and state/
@@ -173,36 +174,17 @@ your-project/
 
 **Your project root is untouched** — nothing nanogent-related lives outside `.nanogent/`. Teams commit `.nanogent/` as a unit to share prompt, tools, and config; runtime state stays local.
 
-### Node vs Docker
+### Running in Docker
 
-`nanogent start` picks the mode automatically based on `.nanogent/config.json`:
+`nanogent start` always runs `docker compose up --build` against `.nanogent/docker-compose.yml`. The CLI fails fast with an install hint if `docker` isn't on PATH.
 
-```json
-{ "docker": false }     // run as a node process in the current shell
-{ "docker": true }      // run in a container via docker compose
-```
+**Docker specifics:** the container binds the project root (`..` from `.nanogent/`'s perspective) as `/workspace`, and mounts `~/.claude` + `~/.claude.json` so the `claude` tool can reuse your host auth. The container is the sandbox — `claude` sees only the bind-mounted project root, not the rest of the host filesystem.
 
-Override at the command line without editing config:
-
-```bash
-nanogent start --node      # force node mode
-nanogent start --docker    # force docker mode
-```
-
-**Background supervision** (node mode):
-
-```bash
-nohup node .nanogent/nanogent.ts > nanogent.log 2>&1 &    # quick & dirty
-pm2 start .nanogent/nanogent.ts --name nanogent           # or pm2
-```
-
-**Docker specifics:** the container binds the project root (`..` from `.nanogent/`'s perspective) as `/workspace`, and mounts `~/.claude` + `~/.claude.json` so the `claude` tool can reuse your host auth. Recommended for VPS / VM / Pi setups where you'd rather not run `--dangerously-skip-permissions` directly on the host.
-
-**Plugin dependencies in the image:** the core `Dockerfile` is just the base (`FROM node:24-slim` + git/ca-certificates). Any container-side dependency a plugin needs — e.g., the `claude` CLI for `tools/claude` — lives next to that plugin as an `install.sh` script. `nanogent build` walks every plugin folder, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into `.nanogent/Dockerfile.generated`, which is what `docker-compose.yml` actually builds from. `nanogent init` runs the build automatically; `nanogent start --docker` re-runs it if the generated file is missing. Run `nanogent build` by hand after adding, removing, or editing any plugin's `install.sh`. Swapping `tools/claude` for `tools/opencode` (with its own `install.sh`) changes what the image installs without anyone editing the core Dockerfile — see [DR-011](DESIGN.md#dr-011-plugins-inject-container-dependencies-via-installsh).
+**Plugin dependencies in the image:** the core `Dockerfile` is just the base (`FROM node:24-slim` + git/ca-certificates). Any container-side dependency a plugin needs — e.g., the `claude` CLI for `tools/claude` — lives next to that plugin as an `install.sh` script. `nanogent build` walks every plugin folder, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into `.nanogent/Dockerfile.generated`, which is what `docker-compose.yml` actually builds from. `nanogent init` runs the build automatically; `nanogent start` re-runs it if the generated file is missing. Run `nanogent build` by hand after adding, removing, or editing any plugin's `install.sh`. Swapping `tools/claude` for `tools/opencode` (with its own `install.sh`) changes what the image installs without anyone editing the core Dockerfile — see [DR-011](DESIGN.md#dr-011-plugins-inject-container-dependencies-via-installsh).
 
 **Auth on a headless VM:** SSH in, run `claude` once on the host, complete the login flow, and `~/.claude` will exist on the VM. The container reuses it on every boot — no token plumbing required.
 
-Detached docker: `nanogent start --docker` ... then Ctrl+C. Or `cd .nanogent && docker compose up -d --build`. Follow logs with `docker compose logs -f`.
+**Detached runs:** `cd .nanogent && docker compose up -d --build`. Follow logs with `docker compose logs -f`.
 
 ## Configuration
 
@@ -223,15 +205,12 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```json
 {
   "projectName": "acme-website",
-  "docker": false,
   "chatModel": "claude-haiku-4-5",
-  "maxHistory": 80,
   "maxTokens": 1024
 }
 ```
 
 - `projectName` — identifier for this install; surfaces in logs, system prompt, and tool context
-- `docker` — whether `nanogent start` uses compose or plain node (overridable via `--docker`/`--node`)
 - `chatModel` — Anthropic model for the chat-agent routing layer. Default `claude-haiku-4-5` (cheap + fast)
 - `maxTokens` — max output tokens per chat-agent turn
 
@@ -289,7 +268,7 @@ Env vars (`NANOGENT_CHAT_MODEL`, `NANOGENT_MAX_HISTORY`, `NANOGENT_MAX_TOKENS`) 
 
 1. Copy the keys into `.nanogent/.env` (simplest)
 2. Symlink: `ln -s ../.env .nanogent/.env`
-3. Set them as real environment variables (systemd unit, pm2 ecosystem, docker `environment:`) — the runtime falls back to `process.env` for every key, so no `.env` file is strictly required
+3. Set them as real environment variables via `docker-compose.yml`'s `environment:` block (or a systemd unit that runs `docker compose up`) — the runtime falls back to `process.env` for every key, so no `.env` file is strictly required
 
 **The system prompt** lives in `.nanogent/prompt.md`. Edit it to describe the project, the client, the tone, and anything specific to this engagement. It's loaded verbatim on every turn (with the stable base cached via Anthropic prompt caching).
 
@@ -529,7 +508,7 @@ What v0.8.0 adds:
 - A new `tools/claude/install.sh` that installs the `claude` CLI. This is the *only* file that owns the `@anthropic-ai/claude-code` dependency now.
 - `docker-compose.yml` builds from `Dockerfile.generated` instead of `Dockerfile`. `Dockerfile.generated` is gitignored as a build artifact.
 - `nanogent init` auto-runs build at the end so fresh installs are immediately docker-ready.
-- `nanogent start --docker` auto-runs build if `Dockerfile.generated` is missing — so one-shot docker starts on a fresh checkout "just work".
+- `nanogent start` auto-runs build if `Dockerfile.generated` is missing — so one-shot starts on a fresh checkout "just work".
 
 ```bash
 # 1. Update nanogent
@@ -548,16 +527,14 @@ nanogent build
 nanogent start
 ```
 
-**Breaking changes for docker users:** the image tag has to be rebuilt because the Dockerfile shape changed. `nanogent start --docker` passes `--build` to compose, so `nanogent start` handles it automatically.
-
-**Breaking changes for node-mode users:** none. `install.sh` files only run inside the docker image. If you're running nanogent as a plain node process, you're still responsible for having the `claude` CLI installed on the host (same as before 0.8.0).
+**Breaking changes:** the image tag has to be rebuilt because the Dockerfile shape changed. `nanogent start` passes `--build` to compose, so it handles this automatically.
 
 **Philosophical notes:**
 
 - The core Dockerfile is *open for extension, closed for modification*. Adding a new tool that needs `go`, `rust`, `pandoc`, or a Python wheel means shipping an `install.sh` in the plugin folder, not editing core.
 - Plugin `install.sh` runs as root during `docker compose build`. This is a meaningful trust surface — only install plugins whose `install.sh` you would be comfortable running as root inside your build context.
 - `Dockerfile.generated` is a derived artifact, like `package-lock.json` for Docker. It's content-addressed by plugin discovery order (fixed: `tools`, `channels`, `providers`, `history`, `memory`, `scheduler`) so Docker's layer cache survives across unrelated plugin additions.
-- Build is pure file-generation — no docker daemon needed. Safe to run on any host, including ones that will only ever use node mode.
+- Build is pure file-generation — no docker daemon needed to run `nanogent build` itself.
 
 See [DESIGN.md DR-011](DESIGN.md#dr-011-plugins-inject-container-dependencies-via-installsh) for the full rationale and plugin-author checklist.
 
@@ -593,6 +570,29 @@ nanogent update
 # 2. Regenerate Dockerfile.generated (unchanged by the update, but this
 #    is when new resources.json advisories would light up if you add one).
 nanogent build
+```
+
+### Migrating from 0.8.1
+
+v0.9.0 makes **Docker the only supported runtime**. The host `node` path (and the `--node` / `--docker` start flags + the `docker` field in `config.json`) is gone. Rationale: plugin `install.sh` scripts can `apt-get`, `npm install -g`, and write to system paths — running those on the host is exactly the pollution Docker was added to prevent. Making Docker mandatory eliminates a dual-install contract and collapses the test matrix.
+
+What changed:
+
+- `nanogent start` always runs `docker compose up --build`. The `--node` and `--docker` flags are gone.
+- `.nanogent/config.json` no longer has a `docker` field. The `Config` type in `types.d.ts` no longer declares it.
+- The CLI fails fast with an install hint if `docker` isn't on PATH.
+- The host machine still needs Node ≥ 24 for the CLI itself (`init`, `build`, `update`), but the runtime inside the container ships its own Node.
+
+```bash
+# 1. Update nanogent
+npm install -g nanogent@latest
+nanogent update
+
+# 2. Remove the now-ignored `docker` field from .nanogent/config.json
+$EDITOR .nanogent/config.json
+
+# 3. Start — docker compose up --build, always
+nanogent start
 ```
 
 Once running, a client just sends any text to the bot. The chat agent:
@@ -790,11 +790,8 @@ Your chat history, learnings, and job state all live in `.nanogent/state/` and a
 ### Stopping
 
 ```bash
-# stop (node)
-Ctrl+C                # or: pm2 stop nanogent / kill <pid>
-
-# stop (docker)
-cd .nanogent && docker compose down
+Ctrl+C                              # if started in the foreground via `nanogent start`
+cd .nanogent && docker compose down # for detached runs
 ```
 
 ### Fully removing from a project
@@ -869,13 +866,16 @@ mkdir -p /tmp/ng-dev/.nanogent && cd /tmp/ng-dev
 REPO=~/codes/nanogent/template
 
 # Symlink code + plugin dirs so template/ edits are picked up on restart
-ln -s $REPO/nanogent.ts .nanogent/nanogent.ts
-ln -s $REPO/types.d.ts  .nanogent/types.d.ts
-ln -s $REPO/tools       .nanogent/tools
-ln -s $REPO/channels    .nanogent/channels
-ln -s $REPO/providers   .nanogent/providers
-ln -s $REPO/history     .nanogent/history
-ln -s $REPO/memory      .nanogent/memory
+ln -s $REPO/nanogent.ts      .nanogent/nanogent.ts
+ln -s $REPO/types.d.ts       .nanogent/types.d.ts
+ln -s $REPO/Dockerfile       .nanogent/Dockerfile
+ln -s $REPO/docker-compose.yml .nanogent/docker-compose.yml
+ln -s $REPO/tools            .nanogent/tools
+ln -s $REPO/channels         .nanogent/channels
+ln -s $REPO/providers        .nanogent/providers
+ln -s $REPO/history          .nanogent/history
+ln -s $REPO/memory           .nanogent/memory
+ln -s $REPO/scheduler        .nanogent/scheduler
 
 # Copy user-owned files so you can customise without dirtying the repo
 cp $REPO/prompt.md     .nanogent/prompt.md
@@ -883,8 +883,15 @@ cp $REPO/config.json   .nanogent/config.json
 cp $REPO/contacts.json .nanogent/contacts.json
 cp $REPO/.env.example  .nanogent/.env   # then fill TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
 
-# Fill contacts.json with your own Telegram user + chat IDs, then:
+# For a fast dev loop, bypass the CLI and run the runtime directly on the host
+# (skips docker build). This is a *dev shortcut only* — end users must run in
+# docker via `nanogent start`. You're responsible for any host-side deps the
+# plugins you're testing would normally install via install.sh.
 node .nanogent/nanogent.ts
+
+# For an end-to-end docker run, use the CLI as a user would:
+nanogent build    # regenerates .nanogent/Dockerfile.generated from the symlinks
+nanogent start    # docker compose up --build
 ```
 
 Now you can edit anything under `template/` in your editor, Ctrl+C the process, relaunch, and the changes are live — no `nanogent update`, no copy step, no byte-compare skip. All mutable state (`.nanogent/state/`, history JSONL, memory files) lands in `/tmp/ng-dev/`, so the repo working tree stays clean. To reset: `rm -rf /tmp/ng-dev`.

@@ -5,7 +5,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
 const cmd = args[0] || 'help';
@@ -17,9 +17,7 @@ nanogent — per-project chat agent with pluggable tools, channels, and provider
 
   nanogent init             drop everything into .nanogent/ (runtime, prompt, config, contacts, tool, channel, provider)
   nanogent build            regenerate .nanogent/Dockerfile.generated from the base Dockerfile + plugin install.sh files
-  nanogent start            run the listener — reads .nanogent/config.json to choose node or docker mode
-  nanogent start --docker   force docker mode (ignores config.json)
-  nanogent start --node     force node mode (ignores config.json)
+  nanogent start            run the listener in docker (docker compose up --build)
   nanogent update           update runtime code; preserves prompt / config / contacts / local plugin edits
   nanogent update --force   also overwrite locally-modified plugin files
   nanogent update --dry-run show what update would do, without changing files
@@ -31,8 +29,7 @@ after init:
   2. fill TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY in .env
   3. edit .nanogent/contacts.json — replace the REPLACE_WITH_YOUR_TELEGRAM_* placeholders
   4. edit .nanogent/prompt.md for this project / client
-  5. optionally flip "docker": true in .nanogent/config.json
-  6. nanogent start
+  5. nanogent start
 
 in-chat (once running):
   any text    → routed through the chat agent, which may delegate to tools
@@ -41,7 +38,10 @@ in-chat (once running):
   /clear      wipe chat history for the current chat
   /help       show command list
 
-to stop:    Ctrl+C   (or: kill <pid> / pm2 stop / docker compose down)
+docker is required — nanogent always runs the listener inside a container so
+plugin dependencies stay isolated from the host project.
+
+to stop:    Ctrl+C   (or: cd .nanogent && docker compose down)
 to update:  nanogent update
 to remove:  nanogent uninstall   (or: rm -rf .nanogent)
 `;
@@ -532,12 +532,16 @@ export function runBuild(opts: BuildOptions = {}): BuildResult {
   return { outputPath, installs, resources };
 }
 
-/** Read .nanogent/config.json if present, return empty object otherwise. */
-function readConfig(): { docker?: boolean } {
-  try {
-    return JSON.parse(readFileSync(join(process.cwd(), '.nanogent', 'config.json'), 'utf8')) as { docker?: boolean };
-  } catch {
-    return {};
+/**
+ * Fail fast if docker is missing from PATH. `nanogent start` has no fallback
+ * runtime — without docker there's nothing to run — so produce a clear hint
+ * instead of letting `spawn('docker', ...)` emit a bare ENOENT.
+ */
+function requireDocker(): void {
+  const probe = spawnSync('docker', ['--version'], { stdio: 'ignore' });
+  if (probe.error || probe.status !== 0) {
+    console.error('docker not found on PATH — install Docker Desktop or docker + compose and retry');
+    process.exit(1);
   }
 }
 
@@ -569,9 +573,8 @@ if (!invokedDirectly) {
       try { chmodSync(join(process.cwd(), dest), 0o755); } catch { /* best-effort */ }
     }
   }
-  // Seed Dockerfile.generated so `nanogent start --docker` works on a fresh
-  // init without an extra step. The build is pure file-gen (no docker
-  // needed), so this is safe on any host.
+  // Seed Dockerfile.generated so `nanogent start` works on a fresh init
+  // without an extra step. Pure file-gen — no docker daemon needed.
   try { runBuild(); } catch (e) { console.error(`build warning: ${(e as Error).message}`); }
   console.log([
     '',
@@ -594,43 +597,26 @@ if (!invokedDirectly) {
     process.exit(1);
   }
 } else if (cmd === 'start') {
-  // Mode selection: explicit flag > config.json > node default
-  const explicitDocker = args.includes('--docker');
-  const explicitNode   = args.includes('--node');
-  let useDocker: boolean;
-  if (explicitDocker) useDocker = true;
-  else if (explicitNode) useDocker = false;
-  else useDocker = !!readConfig().docker;
-
-  if (useDocker) {
-    const composePath = join(process.cwd(), '.nanogent', 'docker-compose.yml');
-    if (!existsSync(composePath)) {
-      console.error('.nanogent/docker-compose.yml not found — run `nanogent init` first');
-      process.exit(1);
-    }
-    // Auto-build Dockerfile.generated on first docker start, or after an
-    // update that bumped the base but didn't touch plugin installs. Cheap
-    // file-gen; docker-compose then does the real image build.
-    const generatedPath = join(process.cwd(), '.nanogent', 'Dockerfile.generated');
-    if (!existsSync(generatedPath)) {
-      try {
-        runBuild();
-      } catch (e) {
-        console.error(`build failed: ${(e as Error).message}`);
-        process.exit(1);
-      }
-    }
-    spawn('docker', ['compose', '-f', composePath, 'up', '--build'], { stdio: 'inherit' })
-      .on('exit', c => { process.exit(c ?? 0); });
-  } else {
-    const script = join(process.cwd(), '.nanogent', 'nanogent.ts');
-    if (!existsSync(script)) {
-      console.error('.nanogent/nanogent.ts not found — run `nanogent init` first');
-      process.exit(1);
-    }
-    spawn(process.execPath, [script], { stdio: 'inherit' })
-      .on('exit', c => { process.exit(c ?? 0); });
+  const composePath = join(process.cwd(), '.nanogent', 'docker-compose.yml');
+  if (!existsSync(composePath)) {
+    console.error('.nanogent/docker-compose.yml not found — run `nanogent init` first');
+    process.exit(1);
   }
+  requireDocker();
+  // Auto-build Dockerfile.generated if missing (e.g. first start after a
+  // fresh checkout that skipped `nanogent init`). Cheap file-gen; compose
+  // then does the real image build.
+  const generatedPath = join(process.cwd(), '.nanogent', 'Dockerfile.generated');
+  if (!existsSync(generatedPath)) {
+    try {
+      runBuild();
+    } catch (e) {
+      console.error(`build failed: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  }
+  spawn('docker', ['compose', '-f', composePath, 'up', '--build'], { stdio: 'inherit' })
+    .on('exit', c => { process.exit(c ?? 0); });
 } else if (cmd === 'update') {
   if (!existsSync(join(process.cwd(), '.nanogent'))) {
     console.error('.nanogent/ not found — run `nanogent init` first');

@@ -17,6 +17,7 @@ Versions referenced:
 - **v0.5.0** — History and memory extracted into separate plugin directories. History store is the raw append-only log; memory is the indexer/retriever. Both are exactly-one-active. See [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) and [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
 - **v0.7.0** — Scheduler introduced as an optional (zero-or-one) plugin type. Time-based proactive triggers are now a first-class concern: the agent manages schedules conversationally via the bundled `schedule` tool, a core tick loop fires due schedules through the shared `fireSystemTurn` entry point, and execution state is stored as an append-only log separate from the rules file. See [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source).
 - **v0.8.0** — Container dependencies made pluggable. The core `Dockerfile` becomes a base stub with a marker line; each plugin can ship an optional `install.sh` next to its `index.ts`, and a new `nanogent build` CLI command composes the real `Dockerfile.generated` by splicing every plugin's install step into the base. The `@anthropic-ai/claude-code` install moves out of core and into `tools/claude/install.sh` — swapping in a different coding harness (e.g. `tools/opencode/`) no longer requires editing the core Dockerfile. See [DR-011](#dr-011-plugins-inject-container-dependencies-via-installsh).
+- **v0.9.0** — Docker becomes the only supported runtime. The host-node path, the `--node` / `--docker` start flags, and the `docker` field in `config.json` are removed. Rationale: plugin `install.sh` scripts can run `apt-get`, `npm install -g`, and write to system paths, so running them on the host is exactly the pollution Docker was added to prevent. Making Docker mandatory eliminates a dual-install contract (host vs container) and collapses the test matrix to one runtime. See [DR-012](#dr-012-docker-is-the-only-supported-runtime).
 
 ## Architecture at a glance
 
@@ -24,7 +25,7 @@ Versions referenced:
 .nanogent/
   nanogent.ts         — core runtime
   prompt.md           — system prompt template
-  config.json         — non-secret config (projectName, chatModel, docker, ...)
+  config.json         — non-secret config (projectName, chatModel, maxTokens)
   contacts.json       — chat allowlist + user mapping + permissions  [v0.4.0+]
   types.d.ts          — plugin contracts (shared, shipped via `init`)
   .env / .env.example — secrets (gitignored via .nanogent/.gitignore)
@@ -640,7 +641,7 @@ The tool plugin system already solves this for *runtime* dependencies: swap out 
 
 This problem generalises beyond `tools/claude`. Different coding harnesses need different CLIs (`claude`, `opencode`, `aider`, `cursor-agent`). A `rag/pgvector` memory plugin needs `postgresql-client`. A `channels/whatsapp` plugin might need `libwebp`. A `providers/local-llm` plugin wants `ollama`. None of these should require touching core.
 
-**Decision:** Make container dependencies pluggable via a new file-level convention: any plugin folder may optionally ship an `install.sh` next to its `index.ts`. A new `nanogent build` CLI command walks every plugin folder under `.nanogent/{tools,channels,providers,history,memory,scheduler}/`, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into a base Dockerfile marker, producing `.nanogent/Dockerfile.generated`. `docker-compose.yml` builds from the generated file, not the base. `nanogent init` auto-runs the build; `nanogent start --docker` re-runs it if the generated file is missing.
+**Decision:** Make container dependencies pluggable via a new file-level convention: any plugin folder may optionally ship an `install.sh` next to its `index.ts`. A new `nanogent build` CLI command walks every plugin folder under `.nanogent/{tools,channels,providers,history,memory,scheduler}/`, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into a base Dockerfile marker, producing `.nanogent/Dockerfile.generated`. `docker-compose.yml` builds from the generated file, not the base. `nanogent init` auto-runs the build; `nanogent start` re-runs it if the generated file is missing.
 
 **What:**
 
@@ -649,7 +650,7 @@ This problem generalises beyond `tools/claude`. Different coding harnesses need 
 - `nanogent build` reads the base Dockerfile, scans plugin folders in `PLUGIN_ROOTS` declaration order (`tools`, `channels`, `providers`, `history`, `memory`, `scheduler`) with alphabetical plugin-name sort within each root, and writes `.nanogent/Dockerfile.generated`. Stable ordering protects Docker's layer cache.
 - Each found `install.sh` emits one block: a comment, a `COPY <rel>/install.sh /tmp/nanogent-install/<rel>/install.sh`, and a `RUN bash /tmp/nanogent-install/<rel>/install.sh`. Docker's build context is already `.nanogent/` (because compose lives inside it with `context: .`), so plugin paths resolve directly.
 - `.nanogent/Dockerfile.generated` is gitignored as a build artifact, analogous to `package-lock.json` for Docker. The base `Dockerfile` is committed; the generated file is not.
-- `nanogent init` runs build at the end of init so fresh installs are immediately docker-ready. `nanogent start --docker` runs build if the generated file is missing so one-shot docker starts on fresh checkouts "just work".
+- `nanogent init` runs build at the end of init so fresh installs are immediately docker-ready. `nanogent start` runs build if the generated file is missing so one-shot starts on fresh checkouts "just work".
 - If the base Dockerfile is missing the marker line, build fails loudly — a silent omission would leave the operator wondering why plugin deps never made it into the image.
 
 **Why:**
@@ -657,16 +658,15 @@ This problem generalises beyond `tools/claude`. Different coding harnesses need 
 - **OCP compliance** — the core Dockerfile no longer knows which plugins are installed. Adding or removing `tools/claude` is now purely a plugin operation; no core edit is required.
 - **Co-locates the dependency with the code that needs it** — the claude tool's runtime code (`tools/claude/index.ts`) and its install script (`tools/claude/install.sh`) live in the same folder. Future plugin authors find them together, reason about them together, and delete them together.
 - **Fail-loud over fail-silent** — a plugin that needs a CLI but doesn't ship an `install.sh` fails visibly at runtime (`claude: command not found`) rather than invisibly masking the dependency. The convention creates a natural slot for the dependency declaration.
-- **Pure file generation, no docker daemon needed** — `nanogent build` can run on any host, including node-mode-only hosts that will never touch docker. Safe to auto-run at init time.
+- **Pure file generation, no docker daemon needed at build time** — `nanogent build` can run on any host; the docker daemon is only required at `nanogent start` time. Safe to auto-run at init.
 - **Preserves layer caching** — stable discovery order (root declaration order, then alphabetical within root) means adding an unrelated plugin doesn't invalidate cached layers for existing ones.
 - **Convention over API** — `install.sh` is a shell script, not a metadata JSON with an `apt` + `npm` + `pip` schema. A shell script is the maximally general contract: apt installs, npm installs, pip installs, curl-to-sh vendor installers, file downloads, and chmods all fit inside one `bash` invocation with no core changes. It trades a slightly larger trust surface (arbitrary root commands during build) for zero core coupling to package-manager choice.
 
 **Consequences:**
 
 - **Plugin install.sh runs as root during `docker compose build`.** This is a meaningful trust surface — installing an untrusted plugin means running its `install.sh` as root inside your build context. Plugin authors should keep install scripts minimal and auditable. Operators should treat third-party plugin installs with the same caution they'd apply to any `curl | bash` — because that's what it is.
-- **A new manual step exists for docker users: `nanogent build` after adding/removing/editing plugin `install.sh` files.** `nanogent start --docker` only auto-runs build when the generated file is *missing*, not when it's stale. Running build manually after plugin changes is the contract; stale-detection (hashing plugin contents) would add complexity for marginal benefit.
+- **A new manual step exists: `nanogent build` after adding/removing/editing plugin `install.sh` files.** `nanogent start` only auto-runs build when the generated file is *missing*, not when it's stale. Running build manually after plugin changes is the contract; stale-detection (hashing plugin contents) would add complexity for marginal benefit.
 - **Trust asymmetry with pure runtime plugins.** Before v0.8.0, a tool plugin could only execute code inside `runTurn` (sandboxed by the tool invocation lifecycle and the permission model). A plugin with an `install.sh` executes code during image build *before* any permission check. Nothing in core mitigates this — it's inherent to the "let plugins modify the image" goal.
-- **Node-mode users are unaffected.** `install.sh` files only run inside the docker image. Running nanogent as a plain node process means host-level dependencies (`claude` on PATH, `node >= 24`, etc.) remain the operator's responsibility — same as before 0.8.0.
 - **Build output is not a new plugin type.** It's a convention applied to existing plugin types. The six plugin-type extensibility points (tool, channel, provider, history, memory, scheduler) stay at six. Every plugin can opt in via `install.sh`; none have to.
 - **The base Dockerfile is still customisable.** Operators who need a different FROM image, extra baseline apt packages, locale settings, or non-root users edit `.nanogent/Dockerfile` (which is `type: code` in the update manifest, so it's overwritten on update — re-apply local changes after `nanogent update`). The marker line must stay intact.
 - **Resource requirements are surfaced as an advisory, not edited into compose.** `install.sh` only controls what's *installed* in the image; the actual `mem_limit` / `cpus` / GPU passthrough in `docker-compose.yml` stays operator-owned. As a v0.8.1 follow-up, plugins may optionally ship a `resources.json` next to `install.sh` declaring `minMemoryMb` / `minCpus` / `note`. `nanogent build` aggregates these across all plugins via `max()` (plugins share one container, so the floor is the hungriest plugin's floor — not the sum) and prints one advisory block at the end of the build, including which plugin set each max and whether `docker-compose.yml` already declares any resource limits. Missing, malformed, or partial `resources.json` files are fine: discovery warns and skips, and the build never fails on an advisory file. GPU passthrough remains out of scope — `resources.json` is advisory-only, no compose mutation, so it has nothing to declare about `device_requests` beyond a free-text `note`.
@@ -684,6 +684,57 @@ This problem generalises beyond `tools/claude`. Different coding harnesses need 
 - [ ] Leave executable bit set (`chmod +x install.sh`) before committing; npm pack strips it, so the CLI re-chmods on init, but git needs it
 - [ ] Run `nanogent build` yourself and confirm the generated COPY + RUN lines look right before pushing a plugin update
 - [ ] If your plugin has a real memory or CPU floor (LSPs, language runtimes, local models), ship an optional `resources.json` next to `install.sh` with `minMemoryMb` / `minCpus` / a short `note`. It's advisory-only — `nanogent build` prints it but never edits `docker-compose.yml`. Skip it for plugins that fit comfortably in the default footprint, so the operator isn't nagged about floors that don't matter.
+
+### DR-012: Docker is the only supported runtime
+
+**Context:** Through v0.8.1, `nanogent start` supported two runtimes: a host `node` process (default) and a containerised `docker compose` run (opt-in via `config.docker: true` or the `--docker` flag). Host mode existed because early versions shipped all plugin dependencies inline in the core Dockerfile — so a host running nanogent as a plain node process could "just install what core needs" (claude CLI + Node 24) and be done.
+
+v0.8.0 changed the shape of that contract fundamentally. With DR-011, plugin dependencies moved out of core and into per-plugin `install.sh` scripts. The install contract is now *inherently container-shaped*: plugin authors can `apt-get install`, `npm install -g`, chown system paths, `curl | bash` vendor installers, and assume they run as root inside a disposable build context. Running those scripts on the host is exactly the pollution Docker was added to prevent. A dual-install contract (host-shaped + container-shaped) would double plugin-author burden, split the test matrix, and require every plugin author to answer "does this work without docker?" for capabilities that have no meaningful host-native form (GPU passthrough, system-locale tweaks, non-root users, pinned apt packages).
+
+Making `.nanogent/` its own npm project was considered as a way to isolate node dependencies from the host project — but it's a half-measure. It only solves the node-module slice; it does nothing for system packages, global CLIs, or any of the other things `install.sh` is designed to install. The coherent path is to require docker for *all* runtime paths, not to invent a second isolation mechanism that overlaps with docker for half the use cases.
+
+**Decision:** Make Docker the only supported runtime. `nanogent start` always runs `docker compose up --build` against `.nanogent/docker-compose.yml`. The `--node` and `--docker` flags are removed. The `docker` field in `config.json` is removed from `template/config.json` and from the `Config` interface in `types.d.ts`. The CLI fails fast with an install hint if `docker` is not on PATH.
+
+**What:**
+
+- `bin/cli.ts` no longer reads `config.json` for mode selection, no longer branches on `--node` / `--docker` flags, and no longer spawns `process.execPath` as a runtime path. The `start` branch is a straight-line `docker compose up --build` invocation.
+- A new `requireDocker()` check runs `docker --version` via `spawnSync` before dispatching. Missing docker prints `"docker not found on PATH — install Docker Desktop or docker + compose and retry"` and exits non-zero.
+- `template/config.json` ships three fields only: `projectName`, `chatModel`, `maxTokens`. The `docker` key is gone.
+- `template/types.d.ts` `Config` interface drops `docker?: boolean`.
+- `template/tools/claude/README.md` drops the "installed on the host OR inside the container" fork and describes the container path only. The `~/.claude` bind-mount remains the auth path.
+- `README.md` rewrites the Requirements + Install & run + Node-vs-Docker sections as a single "Running in Docker" section. Node 24+ is still required on the host for the CLI (`init`, `build`, `update`), but the runtime inside the container ships its own Node.
+
+**Why:**
+
+- **Single-runtime coherence.** Plugin authors write one install story. Operators read one runtime story. Tests exercise one path. The matrix collapses from NxM to N.
+- **Plugin contract is already container-shaped.** DR-011's `install.sh` convention assumes root, a disposable build context, and an ephemeral filesystem. Anything else violates the contract silently.
+- **Host pollution is the problem docker was supposed to solve.** Running plugin installs on the host defeats the point of having an install system at all.
+- **Sandbox is the default, not the opt-in.** The `claude` tool passes `--dangerously-skip-permissions`. Before v0.9.0, operators could trip that footgun by leaving `docker: false` and forgetting to harden the host. v0.9.0 removes the footgun: every `nanogent start` runs inside a container whose only view of the host is the bind-mounted project root plus `~/.claude`.
+- **Pre-release simplification.** nanogent isn't published to npm yet, so there are no installed operators whose config files need a legacy-compatible read path. Deleting the old code is strictly cleaner than adding a legacy branch.
+
+**Consequences:**
+
+- **Docker is a hard dependency.** Hosts without docker (and without the ability to install it) cannot run nanogent. This is the intended trade.
+- **First-start latency increases.** Every fresh checkout now pays a `docker compose build` on the first `nanogent start`. The base image cache amortises it after the first run; plugin `install.sh` layers are cached too as long as the scripts don't change. Operators on slow networks feel this once per machine, not per run.
+- **`nanogent build` is still pure file-gen.** It does not require the docker daemon — it just writes `Dockerfile.generated`. Only `nanogent start` requires docker to actually be running. This keeps `nanogent init`'s auto-build safe on hosts where docker is installed but not currently running.
+- **Dev iteration inside this repo is unaffected.** `tests/**/*.test.ts` exercise pure helpers and do not shell out to docker. For end-to-end runtime testing, the scratch-dir symlink workflow in README.md still works by running `node .nanogent/nanogent.ts` directly as a dev shortcut — that bypass is explicitly documented as a dev-only escape hatch, not a supported end-user path.
+- **Runtime inside the container still hardcodes `.nanogent/`-relative paths.** DR-012 does not change the runtime contract; it only changes how the runtime is invoked from the host.
+- **`--node` tests would fail if they existed.** `tests/cli.test.ts` never exercised flag-based mode switching, so this DR is a zero-test-change move. Any future tests that want to exercise `start` should stub `spawn('docker', ...)` rather than trying to run a real docker compose.
+
+**Alternatives considered and rejected:**
+
+- **Keep both runtimes, document "host mode is best-effort."** Rejected — "best-effort" is the same as "untested in the plugin ecosystem." Every new plugin would silently gain a second compatibility axis that nobody runs CI on.
+- **Make `.nanogent/` its own npm project and run node from inside it.** Rejected — only solves node-module deps, not system packages, not global CLIs, not anything `apt-get` or `curl | bash`. Half-measure that overlaps with docker for the cases it handles and fails for the cases it doesn't.
+- **Per-plugin dual install scripts (`install.sh` + `install-host.sh`).** Rejected — doubles plugin-author burden, splits the test matrix, and requires every author to answer "does this work on macOS / Debian / Alpine / Arch / RHEL?" when the whole point of docker is to eliminate that question.
+- **Require docker only when any plugin ships an `install.sh`.** Rejected — opaque, surprising, and makes the "docker-or-not" question depend on which plugins happen to be installed right now. Operators would get different runtime behaviour from installing a plugin that has nothing to do with them.
+
+**Checklist for contributors touching the start path:**
+
+- [ ] `nanogent start` must shell out to `docker compose up --build` — no alternative runtime path
+- [ ] `requireDocker()` must run before any work that assumes docker is available
+- [ ] Do not read `config.docker` — the field does not exist
+- [ ] Do not re-introduce `--node` / `--docker` flags
+- [ ] Dev-only shortcuts (like `node .nanogent/nanogent.ts` in the scratch-dir README section) must be clearly labelled as dev-only and never promoted to a user-facing runtime path
 
 ### Email plugin — specific guidance
 
@@ -723,5 +774,6 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 - **0.3 (2026-04-15)** — Added DR-010 (scheduler is an optional pluggable proactive trigger source). Captures the v0.7.0 introduction of an optional zero-or-one scheduler plugin type, the 9-method `SchedulerPlugin` contract (definition CRUD + claimDue/markComplete/markFailed + listExecutions), the core-owned `fireSystemTurn` helper as the single entry point for non-user-initiated turns, the once-a-minute tick loop, the definitions-vs-execution-log split in the bundled `scheduler/jsonl` default, and the rationale for keeping definitions/execution in a single plugin while keeping the scheduler itself optional.
 - **0.4 (2026-04-15)** — Added DR-011 (plugins inject container dependencies via install.sh). Captures the v0.8.0 move of container-side installs out of the core Dockerfile and into per-plugin `install.sh` scripts composed by `nanogent build` into `Dockerfile.generated`, the rationale (OCP — swapping `tools/claude` for a hypothetical `tools/opencode` no longer requires editing the core Dockerfile), the stable discovery order for layer-cache stability, the root-execution trust surface it introduces during `docker compose build`, and the explicit deferral of per-plugin compose-level resource requirements (`mem_limit`, `cpus`, GPU passthrough) to a future decision.
 - **0.5 (2026-04-15)** — Reversed the DR-011 deferral on resource requirements: v0.8.1 adds an optional per-plugin `resources.json` next to `install.sh` declaring `minMemoryMb` / `minCpus` / `note`. `nanogent build` discovers these, aggregates with `max()` semantics (plugins share one container), and prints one advisory block per build naming the hungriest plugin and whether `docker-compose.yml` already declares resource limits. Pure advisory — no compose mutation, no build failure on missing/malformed files. Updated the DR-011 Consequences paragraph and plugin-author checklist to cover the new optional file.
+- **0.6 (2026-04-15)** — Added DR-012 (Docker is the only supported runtime). v0.9.0 removes the host-node path and the `--node`/`--docker` flags: `nanogent start` always runs `docker compose up --build`, the CLI fails fast if `docker` is missing from PATH, `config.json` no longer carries a `docker` field, and `types.d.ts` drops it from `Config`. Rationale: DR-011's `install.sh` contract is inherently container-shaped, so supporting a host runtime would force a dual-install contract that doubles plugin-author burden and splits the test matrix. Removed the "node-mode users unaffected" consequence from DR-011 and revised the auto-build trigger wording from `nanogent start --docker` to `nanogent start`.
 
 When adding a new decision or updating an existing one, add a line here with the date and a one-sentence summary.

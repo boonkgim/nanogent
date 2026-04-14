@@ -332,7 +332,6 @@ export interface Config {
   projectName?: string;
   chatModel?: string;
   maxTokens?: number;
-  docker?: boolean;
 }
 
 // ---------------------------------------------------------------------------

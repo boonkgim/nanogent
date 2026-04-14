@@ -14,15 +14,14 @@ When the chat agent calls this tool with `{ prompt, title }`, it:
 
 ## Setup
 
-- The `claude` CLI must be installed and authenticated on the host (or inside the container, if you're running with `docker: true` in `.nanogent/config.json`).
-  - `npm install -g @anthropic-ai/claude-code`
-  - `claude` (complete the login flow once — writes `~/.claude`)
-- On headless VMs, run `claude` once over SSH so `~/.claude` exists on the VM; the container reuses it via the compose bind-mount.
+- The `claude` CLI is installed inside the container automatically by `install.sh` (runs at `nanogent build` / `docker compose build` time).
+- You still need to authenticate once so the container can reuse your credentials: run `claude` on the host to complete the login flow — it writes `~/.claude`, which the compose file bind-mounts into the container.
+- On headless VMs, run `claude` once over SSH so `~/.claude` exists on the VM; the container reuses it via the same bind-mount.
 - No additional API keys beyond your regular Claude Code auth — this tool uses the same credentials `claude --version` would use.
 
 ## Safety
 
-This tool passes `--dangerously-skip-permissions`, so `claude` will run shell commands and edit files without confirmation. Anyone allowed in `TELEGRAM_ALLOWED_CHAT_IDS` can therefore trigger arbitrary work in the project directory via the chat agent. Only enable this tool in projects you trust with chats you trust, or run inside the docker sandbox where the container only sees the bind-mounted project root.
+This tool passes `--dangerously-skip-permissions`, so `claude` will run shell commands and edit files without confirmation. Anyone allowed in `TELEGRAM_ALLOWED_CHAT_IDS` can therefore trigger arbitrary work in the project directory via the chat agent. The docker sandbox limits blast radius to the bind-mounted project root, but you should still only enable this tool in projects you trust with chats you trust.
 
 ## Removing it
 
@@ -46,6 +45,6 @@ The adjacent `.gitignore` (`.nanogent/tools/claude/.gitignore`) hides `state/` s
 
 Open `.nanogent/tools/claude/index.mjs` — it's self-contained (imports only from node stdlib and talks to the injected `ctx`). Edit it in place. Common tweaks:
 
-- **Different `claude` flags** — e.g. remove `--dangerously-skip-permissions` if you want permission prompts on the host (only useful when running without docker).
+- **Different `claude` flags** — e.g. remove `--dangerously-skip-permissions` if you want `claude` to prompt inside the container before running commands.
 - **Different output format** — the current parser is tuned for `stream-json`; if you prefer the plain streaming output, change the args and drop the `stream-json` parser.
 - **Session scope** — delete `state/session.marker` to force a fresh session on the next run.
