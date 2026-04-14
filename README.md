@@ -45,11 +45,33 @@ Anthropic's [Claude Code Channels](https://code.claude.com/docs/en/channels) pus
 **Use Channels** when you're coding interactively and want a chat-flavored remote for your live session.
 **Use nanogent** when you want a per-project assistant you can hand to a client, run on a VPS, or compose with custom tools.
 
-## Why decentralised?
+## Design principles
 
-Most Telegram→agent tools run a **single central process** with a config mapping chat IDs → projects. That's powerful but heavy: one process owns every project, and tearing it down is a global operation.
+nanogent is opinionated. These principles shape every decision in the codebase — what to add, what to refuse, and where to draw the line between core and tools. If you're evaluating nanogent, they tell you the flavour; if you're customising it or writing your own tools, they're the compass for decisions at the margin.
 
-**nanogent inverts that.** Each project gets its own listener, its own Telegram bot (or just its own allowlisted chat IDs), its own system prompt, its own tool set, and its own lifecycle. Start it when you're working on the project, stop it when you're not, remove it when you're done. The project owns the bridge.
+**Decentralised — one project, one install, one lifecycle.**
+Each project owns its own listener, its own Telegram bot (or allowlisted chat IDs), its own system prompt, its own tool set. No central router, no shared config, no process that knows about every project at once. Start nanogent when you're working on a project, stop it when you're not, `rm -rf .nanogent/` when you're done. Teams running many projects run many nanogent instances — one per project — and each is individually startable, stoppable, and removable. If you find yourself wanting a central control plane, nanogent is the wrong tool.
+
+**Readable over clever.**
+The runtime is a single file (`.nanogent/nanogent.mjs`) with zero npm dependencies. It uses raw `fetch` against the Anthropic and Telegram APIs instead of pulling in the official SDKs. You should be able to `cat` it and understand the whole thing in one sitting — every tool dispatch, every queue, every piece of state. If a proposed change would make the file materially harder to read in exchange for a minor feature, the change loses.
+
+**Drop a folder, delete a folder.**
+The whole install lives under `.nanogent/`. Nothing nanogent-related lives outside it — no symlinks, no system-wide state, no registry entries, no global npm package. Install is dropping a directory; uninstall is deleting one. Moving a project between machines is `cp -r .nanogent/`. If you're tempted to write state under `~/`, under `/etc/`, or in the user's project root, don't — put it in `.nanogent/`.
+
+**Open/closed core, pluggable tools.**
+The core runtime never changes to add capability. New tools are drop-in folders in `.nanogent/tools/<name>/` with a required `index.mjs` that default-exports `{ name, description, input_schema, execute }`. The core scans the tools directory at startup; it has no hardcoded knowledge of `claude`, `opencode`, `rag`, or any other specific tool. If you find yourself editing `nanogent.mjs` to support a new capability, stop — the capability is a tool, not a core change.
+
+**Each tool is standalone.**
+A tool imports only from node stdlib and talks to the injected `ctx` — never from sibling tools, a shared helper file, or a tool SDK. Drop a tool folder into another project's `.nanogent/tools/` and it should just work. If you catch yourself wanting to share code between tools, copy it — don't extract it. Three similar files are better than a premature abstraction that won't fit the second implementation when it arrives.
+
+**Core does not dictate tool internals.**
+Tools own their own state, their own `.gitignore`, their own persistence decisions. The core's top-level `.gitignore` anchors its rules to core-owned paths (`/state/`, not `state/`) and only adds sensible safety defaults (`.env` at any depth, because silently committing secrets is a failure class that trumps tool autonomy). If a tool wants its state committed to git (e.g. a RAG index that took hours to build), the core doesn't prevent it. If a tool wants its state hidden, the tool ships its own `.gitignore`. The core stays out of that decision.
+
+**Non-blocking by default.**
+The chat agent never waits on a long-running tool. Tools that do slow work (spawn a CLI, hit a slow API, run an embedding job) return `{ async: true, jobId }` immediately and register a background promise. The chat agent continues responding to the client — status checks, cancellations, even unrelated questions — while the job runs. When the job finishes, a synthetic `[SYSTEM]` message re-enters the conversation so the chat agent can acknowledge completion. If you're writing a tool that takes more than a couple of seconds, make it async.
+
+**YAGNI beats future-proofing.**
+No tool manifests, no versioning fields, no registration files, no helper library, no config schemas, no plugin lifecycle hooks. Every abstraction in nanogent lands only because a concrete use case forced it — and preemptive ones get deleted the moment they're caught. If you're tempted to add a layer for "future flexibility," wait until something concrete demands it.
 
 ## Requirements
 
