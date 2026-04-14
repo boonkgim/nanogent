@@ -1,4 +1,5 @@
 {
+  "projectName": "nanogent",
   "docker": false,
   "chatModel": "claude-haiku-4-5",
   "maxHistory": 80,

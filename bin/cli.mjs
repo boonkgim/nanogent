@@ -48,13 +48,24 @@ const MANIFEST = [
   { src: 'nanogent.mjs',       dest: '.nanogent/nanogent.mjs' },
   { src: 'prompt.md',          dest: '.nanogent/prompt.md' },
   { src: 'config.json',        dest: '.nanogent/config.json' },
+  { src: 'contacts.json',      dest: '.nanogent/contacts.json' },
   { src: '.env.example',       dest: '.nanogent/.env.example' },
   { src: 'gitignore',          dest: '.nanogent/.gitignore' },   // npm strips .gitignore from packages, so ship it as `gitignore` and rename on install
   { src: 'Dockerfile',         dest: '.nanogent/Dockerfile' },
   { src: 'docker-compose.yml', dest: '.nanogent/docker-compose.yml' },
+
+  // Default tool
   { src: 'tools/claude/index.mjs', dest: '.nanogent/tools/claude/index.mjs' },
   { src: 'tools/claude/README.md', dest: '.nanogent/tools/claude/README.md' },
   { src: 'tools/claude/gitignore', dest: '.nanogent/tools/claude/.gitignore' },  // same npm-strips-.gitignore workaround
+
+  // Default channel
+  { src: 'channels/telegram/index.mjs', dest: '.nanogent/channels/telegram/index.mjs' },
+  { src: 'channels/telegram/README.md', dest: '.nanogent/channels/telegram/README.md' },
+
+  // Default provider
+  { src: 'providers/anthropic/index.mjs', dest: '.nanogent/providers/anthropic/index.mjs' },
+  { src: 'providers/anthropic/README.md', dest: '.nanogent/providers/anthropic/README.md' },
 ];
 
 function copyFromManifest(manifest) {
@@ -96,8 +107,9 @@ if (cmd === 'init') {
     '',
     'next:',
     '  cp .nanogent/.env.example .nanogent/.env',
-    '  $EDITOR .nanogent/.env          # fill in tokens and ANTHROPIC_API_KEY',
-    '  $EDITOR .nanogent/prompt.md     # tailor the prompt for this project / client',
+    '  $EDITOR .nanogent/.env           # fill in TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY',
+    '  $EDITOR .nanogent/contacts.json  # add yourself as an operator with your Telegram chatId',
+    '  $EDITOR .nanogent/prompt.md      # tailor the system prompt for this project / client',
     '  nanogent start',
   ].join('\n'));
 } else if (cmd === 'start') {

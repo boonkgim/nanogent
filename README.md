@@ -69,6 +69,8 @@ That's the split: **code for the deterministic, LLMs for the probabilistic.** Se
 
 nanogent is opinionated. These principles shape every decision in the codebase — what to add, what to refuse, and where to draw the line between core and tools. If you're evaluating nanogent, they tell you the flavour; if you're customising it or writing your own tools, they're the compass for decisions at the margin.
 
+> **Plugin authors and contributors**: the principles below describe nanogent's *character*. For the concrete *design decisions* that follow from them — channel plugin contracts, `chatId` semantics, permission model, email-specific guidance, etc. — see [DESIGN.md](DESIGN.md). That document is the normative reference for anyone writing a new channel, tool, or provider plugin.
+
 **Decentralised — one project, one install, one lifecycle.**
 Each project owns its own listener, its own Telegram bot (or allowlisted chat IDs), its own system prompt, its own tool set. No central router, no shared config, no process that knows about every project at once. Start nanogent when you're working on a project, stop it when you're not, `rm -rf .nanogent/` when you're done. Teams running many projects run many nanogent instances — one per project — and each is individually startable, stoppable, and removable. If you find yourself wanting a central control plane, nanogent is the wrong tool.
 
@@ -110,10 +112,11 @@ One command drops everything into a single `.nanogent/` directory — your proje
 
 ```bash
 cd your-project
-npx nanogent init                       # drops .nanogent/ (runtime, prompt, config, tools, Dockerfile, compose)
-cp .nanogent/.env.example .nanogent/.env # fill in TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, ANTHROPIC_API_KEY
-$EDITOR .nanogent/prompt.md              # tailor the system prompt for this project / client
-nanogent start                           # reads .nanogent/config.json to choose node or docker mode
+npx nanogent init                        # drops .nanogent/ with all plugin folders
+cp .nanogent/.env.example .nanogent/.env  # fill in TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
+$EDITOR .nanogent/contacts.json           # add yourself as operator with your Telegram chatId
+$EDITOR .nanogent/prompt.md               # tailor the system prompt for this project / client
+nanogent start                            # reads .nanogent/config.json to choose node or docker mode
 ```
 
 What lands in your project:
@@ -121,17 +124,28 @@ What lands in your project:
 ```
 your-project/
   .nanogent/
-    nanogent.mjs         ← runtime (readable, auditable, committed to git)
-    config.json          ← non-secret settings (docker, chatModel, etc.) — committed
-    prompt.md            ← system prompt — committed
-    Dockerfile           ← dropped always; inert unless config.docker=true
-    docker-compose.yml   ← same
+    nanogent.mjs              ← core runtime (readable, auditable, committed)
+    config.json               ← non-secret settings (projectName, docker, chatModel) — committed
+    contacts.json             ← access control + identity map — committed
+    prompt.md                 ← system prompt — committed
+    Dockerfile                ← dropped always; inert unless config.docker=true
+    docker-compose.yml        ← same
+    .env.example              ← template for secrets — committed
+    .env                      ← actual secrets — gitignored via .nanogent/.gitignore
+    .gitignore                ← hides .env and state/
+    state/                    ← runtime state (history, jobs, learnings) — gitignored
     tools/
-      claude.mjs         ← default coding tool — committed
-    .env.example         ← template for secrets — committed
-    .env                 ← actual secrets — gitignored via .nanogent/.gitignore
-    .gitignore           ← hides .env and state/
-    state/               ← runtime state (history, jobs, learnings) — gitignored
+      claude/                 ← default coding tool
+        index.mjs
+        README.md
+    channels/
+      telegram/               ← default channel plugin
+        index.mjs
+        README.md
+    providers/
+      anthropic/              ← default AI provider plugin
+        index.mjs
+        README.md
 ```
 
 **Your project root is untouched** — nothing nanogent-related lives outside `.nanogent/`. Teams commit `.nanogent/` as a unit to share prompt, tools, and config; runtime state stays local.
@@ -167,24 +181,23 @@ Detached docker: `nanogent start --docker` ... then Ctrl+C. Or `cd .nanogent && 
 
 ## Configuration
 
-Two files, two concerns:
+Three files, three concerns:
 
 **`.nanogent/.env`** (secrets — gitignored):
 
 ```
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_ALLOWED_CHAT_IDS=123456789,987654321
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-- `TELEGRAM_BOT_TOKEN` — required
-- `TELEGRAM_ALLOWED_CHAT_IDS` — comma-separated chat IDs. **Leave empty to allow anyone** (not recommended)
-- `ANTHROPIC_API_KEY` — required, for the chat agent itself
+- `TELEGRAM_BOT_TOKEN` — required by the telegram channel plugin
+- `ANTHROPIC_API_KEY` — required by the anthropic provider plugin
 
 **`.nanogent/config.json`** (non-secrets — committed):
 
 ```json
 {
+  "projectName": "acme-website",
   "docker": false,
   "chatModel": "claude-haiku-4-5",
   "maxHistory": 80,
@@ -192,10 +205,57 @@ ANTHROPIC_API_KEY=sk-ant-...
 }
 ```
 
+- `projectName` — identifier for this install; surfaces in logs, system prompt, and tool context
 - `docker` — whether `nanogent start` uses compose or plain node (overridable via `--docker`/`--node`)
-- `chatModel` — Anthropic model for the chat-agent routing layer. Default `claude-haiku-4-5` (cheap + fast). Override to `claude-sonnet-4-5` or `claude-opus-4-6` for smarter chat at higher cost.
-- `maxHistory` — turns kept in `state/history.jsonl` before boundary-aware rotation kicks in
+- `chatModel` — Anthropic model for the chat-agent routing layer. Default `claude-haiku-4-5` (cheap + fast)
+- `maxHistory` — turns kept in history before boundary-aware rotation
 - `maxTokens` — max output tokens per chat-agent turn
+
+**`.nanogent/contacts.json`** (access control + identity — committed):
+
+```json
+{
+  "alwaysAllowed": ["skip"],
+  "users": {
+    "alice": { "displayName": "Alice", "tools": ["claude", "learn"] },
+    "bob":   { "displayName": "Bob",   "tools": ["claude"] }
+  },
+  "chats": {
+    "alice-dm": {
+      "channel": "telegram",
+      "chatId":  "12345",
+      "displayName": "Alice (DM)",
+      "userMapping": { "12345": "alice" },
+      "userTools":   ["claude", "learn"],
+      "allowGuests": false,
+      "historyMode": "shared",
+      "mode":        "always",
+      "enabled":     true
+    },
+    "project-group": {
+      "channel": "telegram",
+      "chatId":  "-1001234567890",
+      "userMapping": { "12345": "alice", "67890": "bob" },
+      "userTools":   ["claude"],
+      "allowGuests": false,
+      "historyMode": "shared",
+      "mode":        "mention"
+    }
+  }
+}
+```
+
+This is the **one file that controls who can reach the bot and what they can do.** The semantics, in short:
+
+- **Unknown `(channel, chatId)` → silent drop + log.** The bot is invisible to anyone not in the allowlist. No tokens spent, no history entry, no response.
+- **Known chat → user identified via `chat.userMapping`.** Map platform user IDs (Telegram `from.id`, email address, etc.) to usernames defined in the `users` section.
+- **Effective tools = `alwaysAllowed ∪ (user.tools ∩ chat.userTools) ∩ installed`.** Chat-level restrictions intersect with user-level ones. Tools the caller can't invoke are **invisible to the LLM**, not just rejected at call time.
+- **Unknown users in known chats** → treated as guests if `allowGuests: true`; silent-dropped otherwise. Guests get `chat.guestTools` only.
+- **`mode: mention`** → channel plugin filters at ingress; only messages that `@`-mention the bot (or reply to the bot) are forwarded. Saves tokens on noisy groups.
+- **`historyMode: shared`** → one history per chat (right for groups). **`per-user`** → per-(chat, user) histories (right for email inboxes and public helpdesks where senders shouldn't see each other).
+- **Wildcard `chatId: "*"`** → matches any chatId in that channel, for open-channel use cases (email inbox, public support).
+
+For deep design rationale — why these specific tradeoffs, how to handle email with multiple recipients, how to write new channel/provider plugins, etc. — see [DESIGN.md](DESIGN.md).
 
 Env vars (`NANOGENT_CHAT_MODEL`, `NANOGENT_MAX_HISTORY`, `NANOGENT_MAX_TOKENS`) still work as one-off overrides without editing the committed config file.
 
@@ -264,6 +324,53 @@ npx nanogent init
 ```
 
 Chat history, learnings, prompt, config, and tool code are otherwise unaffected.
+
+### Migrating from 0.3.2
+
+v0.4.0 is the **biggest structural change** since the original release. Telegram and Anthropic move out of the core and into plugin folders. Access control moves out of `.env` and into a new `contacts.json`. Multi-channel support lands. Provider pluggability lands.
+
+The net result from a user's perspective:
+
+- **Everything still lives under `.nanogent/`** — the top-level layout philosophy is unchanged
+- **`nanogent.mjs` is still one file you can audit** — ~30 KB, zero npm deps
+- **Access control is now more powerful and more explicit** — individual users with tool allowlists, per-chat restrictions, silent-drop of unknown chats by default
+
+To migrate an existing 0.3.x install:
+
+```bash
+# 1. Preserve your existing prompt, config, and state files (they stay where they are)
+
+# 2. Re-run init to drop the new plugin folders + nanogent.mjs + contacts.json skeleton
+#    (won't overwrite existing files — see `skip (exists)` in the output)
+npx nanogent init
+
+# 3. Overwrite nanogent.mjs with the new version
+rm .nanogent/nanogent.mjs
+npx nanogent init
+
+# 4. Fill in contacts.json with your chat details
+#    Replace REPLACE_WITH_YOUR_TELEGRAM_CHAT_ID / _USER_ID placeholders
+$EDITOR .nanogent/contacts.json
+
+# 5. If you had TELEGRAM_ALLOWED_CHAT_IDS set in .nanogent/.env, remove it —
+#    allowlisting is now in contacts.json. Leave TELEGRAM_BOT_TOKEN and
+#    ANTHROPIC_API_KEY alone, those are still used.
+$EDITOR .nanogent/.env
+
+# 6. Restart — history, learnings, and job state survive the upgrade
+nanogent start
+```
+
+**Breaking changes worth calling out:**
+- `TELEGRAM_ALLOWED_CHAT_IDS` env var is **no longer read**. Move allowlisting to `contacts.json > chats[].userMapping`.
+- Chat history is now **keyed by contact** (derived from the chat entry name), not by raw chatId. Existing histories at `.nanogent/state/history.jsonl` are not automatically migrated — they'll sit there unused. Move them manually to `.nanogent/state/history/<chat-key>.jsonl` if you want to preserve context.
+- The default runtime requires **`contacts.json`** to exist. Without it or with an empty chats section, every incoming message is dropped as unknown.
+
+**Philosophical changes** (see [DESIGN.md](DESIGN.md) for details):
+- Telegram is now a drop-in channel plugin at `.nanogent/channels/telegram/index.mjs`. You can replace it.
+- Anthropic is now a drop-in provider plugin at `.nanogent/providers/anthropic/index.mjs`. You can replace it.
+- Permissions are declared in `contacts.json`, not inside tool files. See DESIGN.md § DR-005.
+- User messages are always prefixed with `[displayName]:` for group chat attribution. See DESIGN.md § DR-003.
 
 Once running, a client just sends any text to the bot. The chat agent:
 
@@ -431,8 +538,9 @@ Uninstalling is deleting one directory. That's still the whole point.
 
 ## Security notes
 
-- **`--dangerously-skip-permissions`** is passed to the `claude` tool so it can run without interactive prompts. That means anyone in your `TELEGRAM_ALLOWED_CHAT_IDS` list can trigger arbitrary shell work in the project directory via the chat agent. **Only use it in projects you trust with chats you trust.** For a hard sandbox, use the Docker option — the container can only see the bind-mounted `/workspace` and the mounted Claude auth.
-- Always set `TELEGRAM_ALLOWED_CHAT_IDS`. Leaving it empty exposes the bot to anyone who discovers its username.
+- **`--dangerously-skip-permissions`** is passed to the `claude` tool so it can run without interactive prompts. That means anyone listed in `.nanogent/contacts.json` with `claude` in their effective tool set can trigger arbitrary shell work in the project directory via the chat agent. **Only use it in projects you trust with chats you trust.** For a hard sandbox, use the Docker option — the container can only see the bind-mounted `/workspace` and the mounted Claude auth.
+- **Always populate `contacts.json`** before starting. An empty `contacts.json` means every incoming message is dropped as unknown — which is the safe default, but no legitimate users can reach the bot either. Add yourself (the operator) as the first entry.
+- **Unknown `(channel, chatId)` pairs are silent-dropped** — the bot is invisible to anyone not explicitly allowlisted. No response, no token use, no history entry. See logs for dropped-contact attempts.
 - Use a **separate bot token per project** for hard isolation. Telegram bot tokens are free and unlimited.
 - **Two cost centers.** Every message costs Anthropic API tokens for the chat agent (usually ~1k input tokens at Haiku rates), *plus* the cost of whichever tool runs. The chat agent is intentionally cheap so small talk doesn't break the bank.
 - Treat `.env` like any other secret file — add it to `.gitignore`.
