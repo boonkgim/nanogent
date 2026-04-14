@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+.nanogent.json
+*.log
+.DS_Store
