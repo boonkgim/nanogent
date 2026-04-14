@@ -2,7 +2,7 @@
 
 A tiny, zero-dependency bridge that runs [Claude Code](https://docs.claude.com/claude-code) **unattended** from Telegram — **per project**, not per machine.
 
-Drop a single file into your project, point it at a Telegram bot, and message it to run `claude -p` headlessly in that folder. No running session required, no interactive permission prompts, no central router, no Docker. When the project is done, delete the file.
+Drop a single file into your project, point it at a Telegram bot, and message it to run `claude -p` headlessly in that folder. No running session required, no interactive permission prompts, no central router. Run it directly with Node, or opt into a one-command Docker sandbox. When the project is done, delete the files.
 
 ```
 ┌─────────┐    messages    ┌──────────────┐   fresh headless    ┌──────────────┐
@@ -45,6 +45,10 @@ Most Telegram→agent tools (OpenClaw, client-agent-router, and arguably Channel
 
 ## Install & run
 
+Two ways to run nanogent — pick whichever fits your box. Both share the same `nanogent.mjs`; only the launcher changes.
+
+### Option A — Node (default, zero deps)
+
 ```bash
 cd your-project
 npx nanogent init              # drops nanogent.mjs + .env.example
@@ -60,6 +64,28 @@ To keep it running in the background, use any process supervisor:
 nohup node nanogent.mjs > nanogent.log 2>&1 &   # quick & dirty
 pm2 start nanogent.mjs --name nanogent          # or pm2
 ```
+
+### Option B — Docker (sandboxed, Node 24)
+
+Same flow, but Claude Code runs inside a container with your project bind-mounted at `/workspace`. Recommended for VPS / VM / Pi setups where you'd rather not run `--dangerously-skip-permissions` directly on the host.
+
+```bash
+cd your-project
+npx nanogent init --docker     # drops nanogent.mjs + .env.example + Dockerfile + docker-compose.yml
+cp .env.example .env           # fill in TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS
+claude                         # one-time: log in on the host so ~/.claude exists
+nanogent start --docker        # or: docker compose up --build
+```
+
+The compose file bind-mounts:
+
+- `.` → `/workspace` — the project Claude works in
+- `~/.claude` → `/root/.claude` — your Claude Code auth (read from the host)
+- `~/.claude.json` → `/root/.claude.json` — same, the per-user config file
+
+**Auth on a headless VM:** SSH in, run `claude` once, complete the login flow, and `~/.claude` will exist on the VM. The container reuses it on every boot — no token plumbing required.
+
+To run detached: `docker compose up -d --build`. To follow logs: `docker compose logs -f`.
 
 ## Configuration
 
@@ -99,18 +125,22 @@ Session state lives in Claude Code's own per-directory history — nanogent stor
 ## Stopping & removing
 
 ```bash
-# stop
+# stop (node)
 Ctrl+C                # or: pm2 stop nanogent / kill <pid>
+
+# stop (docker)
+docker compose down
 
 # fully remove from a project
 rm nanogent.mjs .nanogent.json .env
+rm -f Dockerfile docker-compose.yml   # if you used --docker
 ```
 
 Uninstalling is deleting files. That's the whole point.
 
 ## Security notes
 
-- **`--dangerously-skip-permissions`** is passed to Claude Code so it can run tools without interactive prompts. This means anyone on your `TELEGRAM_ALLOWED_CHAT_IDS` list can run arbitrary shell commands in the project directory. **Only use it in projects you trust with chats you trust.**
+- **`--dangerously-skip-permissions`** is passed to Claude Code so it can run tools without interactive prompts. This means anyone on your `TELEGRAM_ALLOWED_CHAT_IDS` list can run arbitrary shell commands in the project directory. **Only use it in projects you trust with chats you trust.** If you want a hard sandbox, use the Docker option — the container can only see the bind-mounted `/workspace` and the mounted Claude auth, not the rest of the host.
 - Always set `TELEGRAM_ALLOWED_CHAT_IDS`. Leaving it empty exposes the bot to anyone who discovers its username.
 - Use a **separate bot token per project** if you want hard isolation. Telegram bot tokens are free and unlimited.
 - Treat `.env` like any other secret file — add it to `.gitignore`.
