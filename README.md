@@ -1,21 +1,38 @@
 # nanogent
 
-A tiny, zero-dependency bridge that lets you drive [Claude Code](https://docs.claude.com/claude-code) from Telegram — **per project**, not per machine.
+A tiny, zero-dependency bridge that runs [Claude Code](https://docs.claude.com/claude-code) **unattended** from Telegram — **per project**, not per machine.
 
-Drop a single file into your project, point it at a Telegram bot, and message it to run `claude -p` in that folder. No central router. No Docker. No shared config. When the project is done, delete the file.
+Drop a single file into your project, point it at a Telegram bot, and message it to run `claude -p` headlessly in that folder. No running session required, no interactive permission prompts, no central router, no Docker. When the project is done, delete the file.
 
 ```
-┌─────────┐    messages    ┌──────────────┐    claude -p    ┌──────────────┐
-│ Telegram│ ◀────────────▶ │ nanogent.mjs │ ──────────────▶ │ Claude Code  │
-└─────────┘                │  (this repo) │                 │  (headless)  │
-                           └──────────────┘                 └──────────────┘
+┌─────────┐    messages    ┌──────────────┐   fresh headless    ┌──────────────┐
+│ Telegram│ ◀────────────▶ │ nanogent.mjs │ ──────────────────▶ │  claude -p   │
+└─────────┘                │  (this repo) │   per message       │  (spawned)   │
+                           └──────────────┘                     └──────────────┘
                              lives inside
                              your project
 ```
 
+## nanogent vs. Claude Code Channels
+
+In March 2026 Anthropic shipped [Claude Code Channels](https://code.claude.com/docs/en/channels) — an [official Telegram plugin](https://claude.com/plugins/telegram) that pushes messages into a **running** Claude Code session. It's the right tool when you're at your desk with Claude Code open. **nanogent covers the case it doesn't.**
+
+|  | Claude Code Channels | nanogent |
+|---|---|---|
+| Model | MCP plugin → running session | Standalone script → fresh headless run per message |
+| Requires a live Claude Code session? | **Yes** — close the terminal and the channel goes offline | No — spawns `claude -p` on demand |
+| Permission prompts | **Pause remotely** — you must approve at the terminal | Bypassed via `--dangerously-skip-permissions` (allowlist gated) |
+| Deployable on a VPS / Raspberry Pi / headless box? | Awkward — you'd have to keep Claude Code open | Yes — `pm2 start nanogent.mjs` and walk away |
+| Queue / `/cancel` / `/status` mid-job | Conversational (in-session) | Built-in primitives |
+| Moving parts | MCP server + pairing codes + session | One `.mjs` file + `.env` |
+| Supported channels | Telegram, Discord, iMessage | Telegram only, by design |
+
+**Use Channels** when you're coding interactively and want a chat-flavored remote for your live session.
+**Use nanogent** when nobody's at the keyboard — remote ops, agent-on-a-box, batch workflows, or any project you want to poke from your phone while the machine runs headless in a closet.
+
 ## Why decentralized?
 
-Most Telegram→agent tools (OpenClaw, client-agent-router, etc.) run a single central daemon with a config mapping chat IDs → projects. That's powerful but heavy: one process owns every project, and tearing it down is a global operation.
+Most Telegram→agent tools (OpenClaw, client-agent-router, and arguably Channels itself) run a single central process with a config mapping chat IDs → projects. That's powerful but heavy: one process owns every project, and tearing it down is a global operation.
 
 **nanogent** inverts that. Each project gets its own small listener, its own Telegram bot (or just its own allowlisted chat IDs), and its own lifecycle. Start it when you're working on the project, stop it when you're not, remove it when you're done. The project owns the bridge.
 
@@ -101,7 +118,10 @@ Uninstalling is deleting files. That's the whole point.
 ## FAQ
 
 **Does it support WhatsApp / Discord / Slack?**  
-No. Telegram only, by design — keeping it tiny is the point. Fork and swap the transport if you want another channel.
+No. Telegram only, by design — keeping it tiny is the point. If you need Discord or iMessage, [Claude Code Channels](https://code.claude.com/docs/en/channels) already covers those. Fork and swap the transport if you want another channel here.
+
+**Why would I use this instead of Claude Code Channels?**  
+Channels pushes messages into a running Claude Code session — great when you're at your desk. nanogent spawns a fresh headless `claude -p` per message and runs without interactive permission prompts, so it works on a VPS, a Raspberry Pi, or any headless box where nobody's sitting at the terminal. See the [comparison table](#nanogent-vs-claude-code-channels) above.
 
 **Can I run multiple projects at once?**  
 Yes — each project runs its own `nanogent.mjs` process. Give each one its own bot token (or at least its own allowlisted chat) so messages don't cross wires.
