@@ -10,7 +10,9 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runUpdate } from '../bin/cli.ts';
+import {
+  composeDockerfile, discoverPluginInstalls, runBuild, runUpdate,
+} from '../bin/cli.ts';
 
 interface Fixture {
   tpl: string;
@@ -210,3 +212,148 @@ describe('runUpdate', () => {
     } finally { f.cleanup(); }
   });
 });
+
+describe('runBuild', () => {
+  function setupBuildFixture(): { cwd: string; cleanup: () => void } {
+    const cwd = mkdtempSync(join(tmpdir(), 'nanogent-build-'));
+    return {
+      cwd,
+      cleanup: () => { rmSync(cwd, { recursive: true, force: true }); },
+    };
+  }
+
+  const BASE_DOCKERFILE = [
+    'FROM node:24-slim',
+    '',
+    'RUN apt-get update && apt-get install -y git',
+    '',
+    '# __NANOGENT_PLUGIN_INSTALLS__',
+    '',
+    'WORKDIR /workspace',
+    '',
+    'CMD ["node", ".nanogent/nanogent.ts"]',
+    '',
+  ].join('\n');
+
+  it('discoverPluginInstalls finds install.sh in all plugin roots and sorts stably', () => {
+    const f = setupBuildFixture();
+    try {
+      // Two plugins with install.sh, one without, plus an unrelated folder
+      // (underscore-prefixed) that should be skipped.
+      mkdirSync(join(f.cwd, '.nanogent/tools/claude'), { recursive: true });
+      mkdirSync(join(f.cwd, '.nanogent/tools/schedule'), { recursive: true });
+      mkdirSync(join(f.cwd, '.nanogent/tools/_scratch'), { recursive: true });
+      mkdirSync(join(f.cwd, '.nanogent/channels/telegram'), { recursive: true });
+      writeFileSync(join(f.cwd, '.nanogent/tools/claude/install.sh'), '#!/bin/bash\necho a\n');
+      writeFileSync(join(f.cwd, '.nanogent/tools/_scratch/install.sh'), '#!/bin/bash\necho skip\n');
+      writeFileSync(join(f.cwd, '.nanogent/channels/telegram/install.sh'), '#!/bin/bash\necho b\n');
+      // tools/schedule has no install.sh — should not appear
+
+      const installs = discoverPluginInstalls(join(f.cwd, '.nanogent'));
+
+      // Order: PLUGIN_ROOTS declaration order (tools, channels, …), then
+      // alphabetical plugin name within each root. Stable ordering is what
+      // lets Docker's layer cache survive across unrelated plugin additions.
+      assert.deepEqual(
+        installs.map(i => `${i.root}/${i.name}`),
+        ['tools/claude', 'channels/telegram'],
+      );
+      // Path is relative to .nanogent/
+      assert.equal(installs[0]?.scriptPath, 'tools/claude/install.sh');
+      assert.equal(installs[1]?.scriptPath, 'channels/telegram/install.sh');
+    } finally { f.cleanup(); }
+  });
+
+  it('composeDockerfile splices installs into the marker', () => {
+    const generated = composeDockerfile(BASE_DOCKERFILE, [
+      { root: 'tools', name: 'claude', scriptPath: 'tools/claude/install.sh' },
+    ]);
+
+    // Marker is replaced
+    assert.ok(!generated.includes('# __NANOGENT_PLUGIN_INSTALLS__'));
+    // COPY + RUN emitted
+    assert.ok(generated.includes('COPY tools/claude/install.sh /tmp/nanogent-install/tools/claude/install.sh'));
+    assert.ok(generated.includes('RUN bash /tmp/nanogent-install/tools/claude/install.sh'));
+    // Base lines preserved
+    assert.ok(generated.startsWith('FROM node:24-slim'));
+    assert.ok(generated.includes('WORKDIR /workspace'));
+    assert.ok(generated.trimEnd().endsWith('CMD ["node", ".nanogent/nanogent.ts"]'));
+    // Header comment names the contributing plugin
+    assert.ok(generated.includes('tools/claude'));
+  });
+
+  it('composeDockerfile handles zero plugins gracefully', () => {
+    const generated = composeDockerfile(BASE_DOCKERFILE, []);
+    assert.ok(!generated.includes('# __NANOGENT_PLUGIN_INSTALLS__'));
+    assert.ok(!generated.includes('COPY '));
+    assert.ok(!generated.includes('RUN bash '));
+    assert.ok(generated.includes('No plugins contributed install steps.'));
+    // CMD still last
+    assert.ok(generated.trimEnd().endsWith('CMD ["node", ".nanogent/nanogent.ts"]'));
+  });
+
+  it('composeDockerfile throws if marker is missing', () => {
+    const noMarker = 'FROM node:24-slim\nWORKDIR /workspace\nCMD ["node"]\n';
+    assert.throws(
+      () => composeDockerfile(noMarker, []),
+      /__NANOGENT_PLUGIN_INSTALLS__/,
+    );
+  });
+
+  it('composeDockerfile emits multiple installs in the order given', () => {
+    const generated = composeDockerfile(BASE_DOCKERFILE, [
+      { root: 'tools',    name: 'claude',   scriptPath: 'tools/claude/install.sh' },
+      { root: 'channels', name: 'telegram', scriptPath: 'channels/telegram/install.sh' },
+    ]);
+    const cIdx = generated.indexOf('tools/claude/install.sh');
+    const tIdx = generated.indexOf('channels/telegram/install.sh');
+    assert.ok(cIdx >= 0 && tIdx >= 0);
+    assert.ok(cIdx < tIdx, 'plugins should appear in the order discoverPluginInstalls returns');
+  });
+
+  it('runBuild writes Dockerfile.generated from base + plugin installs', () => {
+    const f = setupBuildFixture();
+    try {
+      mkdirSync(join(f.cwd, '.nanogent/tools/claude'), { recursive: true });
+      writeFileSync(join(f.cwd, '.nanogent/Dockerfile'), BASE_DOCKERFILE);
+      writeFileSync(
+        join(f.cwd, '.nanogent/tools/claude/install.sh'),
+        '#!/bin/bash\nnpm install -g @anthropic-ai/claude-code\n',
+      );
+
+      const logs: string[] = [];
+      const result = runBuild({ cwd: f.cwd, logger: (m) => { logs.push(m); } });
+
+      assert.equal(result.installs.length, 1);
+      assert.equal(result.installs[0]?.name, 'claude');
+      const out = readFileSync(join(f.cwd, '.nanogent/Dockerfile.generated'), 'utf8');
+      assert.ok(out.includes('COPY tools/claude/install.sh'));
+      assert.ok(out.includes('RUN bash /tmp/nanogent-install/tools/claude/install.sh'));
+      assert.ok(logs.some(l => l.includes('Dockerfile.generated')));
+    } finally { f.cleanup(); }
+  });
+
+  it('runBuild succeeds with no plugin install.sh files', () => {
+    const f = setupBuildFixture();
+    try {
+      mkdirSync(join(f.cwd, '.nanogent'), { recursive: true });
+      writeFileSync(join(f.cwd, '.nanogent/Dockerfile'), BASE_DOCKERFILE);
+      const result = runBuild({ cwd: f.cwd, logger: () => { /* silent */ } });
+      assert.equal(result.installs.length, 0);
+      const out = readFileSync(join(f.cwd, '.nanogent/Dockerfile.generated'), 'utf8');
+      assert.ok(out.includes('No plugins contributed install steps.'));
+    } finally { f.cleanup(); }
+  });
+
+  it('runBuild throws when base Dockerfile is missing', () => {
+    const f = setupBuildFixture();
+    try {
+      mkdirSync(join(f.cwd, '.nanogent'), { recursive: true });
+      assert.throws(
+        () => runBuild({ cwd: f.cwd, logger: () => { /* silent */ } }),
+        /Dockerfile not found/,
+      );
+    } finally { f.cleanup(); }
+  });
+});
+

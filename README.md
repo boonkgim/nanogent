@@ -133,8 +133,9 @@ your-project/
     config.json               ← non-secret settings (projectName, docker, chatModel) — committed
     contacts.json             ← access control + identity map — committed
     prompt.md                 ← system prompt — committed
-    Dockerfile                ← dropped always; inert unless config.docker=true
-    docker-compose.yml        ← same
+    Dockerfile                ← base image (FROM / apt) — committed
+    Dockerfile.generated      ← produced by `nanogent build` (base + plugin install.sh) — gitignored
+    docker-compose.yml        ← builds from Dockerfile.generated; inert unless config.docker=true
     .env.example              ← template for secrets — committed
     .env                      ← actual secrets — gitignored via .nanogent/.gitignore
     .gitignore                ← hides .env and state/
@@ -142,6 +143,7 @@ your-project/
     tools/
       claude/                 ← default coding tool
         index.ts
+        install.sh            ← container-side deps (installs the `claude` CLI); picked up by `nanogent build`
         README.md
     channels/
       telegram/               ← default channel plugin
@@ -195,6 +197,8 @@ pm2 start .nanogent/nanogent.ts --name nanogent           # or pm2
 ```
 
 **Docker specifics:** the container binds the project root (`..` from `.nanogent/`'s perspective) as `/workspace`, and mounts `~/.claude` + `~/.claude.json` so the `claude` tool can reuse your host auth. Recommended for VPS / VM / Pi setups where you'd rather not run `--dangerously-skip-permissions` directly on the host.
+
+**Plugin dependencies in the image:** the core `Dockerfile` is just the base (`FROM node:24-slim` + git/ca-certificates). Any container-side dependency a plugin needs — e.g., the `claude` CLI for `tools/claude` — lives next to that plugin as an `install.sh` script. `nanogent build` walks every plugin folder, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into `.nanogent/Dockerfile.generated`, which is what `docker-compose.yml` actually builds from. `nanogent init` runs the build automatically; `nanogent start --docker` re-runs it if the generated file is missing. Run `nanogent build` by hand after adding, removing, or editing any plugin's `install.sh`. Swapping `tools/claude` for `tools/opencode` (with its own `install.sh`) changes what the image installs without anyone editing the core Dockerfile — see [DR-011](DESIGN.md#dr-011-plugins-inject-container-dependencies-via-installsh).
 
 **Auth on a headless VM:** SSH in, run `claude` once on the host, complete the login flow, and `~/.claude` will exist on the VM. The container reuses it on every boot — no token plumbing required.
 
@@ -513,6 +517,49 @@ rm -rf .nanogent/tools/schedule
 - The agent creates schedules conversationally through the `schedule` tool. There's no terminal command to edit schedules directly — use the chat, or edit `state/schedules.json` by hand if you really need to.
 
 See [`.nanogent/scheduler/jsonl/README.md`](template/scheduler/jsonl/README.md), [`.nanogent/tools/schedule/README.md`](template/tools/schedule/README.md), and [DESIGN.md DR-010](DESIGN.md#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source) for plugin-author guidance and the full rationale.
+
+### Migrating from 0.7.0
+
+v0.8.0 makes container dependencies pluggable. Until 0.7.0, the core `Dockerfile` hard-coded `npm install -g @anthropic-ai/claude-code`, so swapping `tools/claude` for a different coding tool meant editing the core Dockerfile — a clean OCP violation. v0.8.0 moves that install out of core and into `tools/claude/install.sh`, and adds a new `nanogent build` step that composes the real `Dockerfile.generated` from the base Dockerfile plus every plugin's optional `install.sh`.
+
+What v0.8.0 adds:
+
+- A new `nanogent build` CLI command. Scans `.nanogent/{tools,channels,providers,history,memory,scheduler}/*/install.sh` and writes `.nanogent/Dockerfile.generated`.
+- A base Dockerfile that ships only `FROM node:24-slim` + `git` + `ca-certificates`, with a `# __NANOGENT_PLUGIN_INSTALLS__` marker where plugin installs are spliced in. Edit it to change the FROM image or baseline apt packages; leave the marker line intact.
+- A new `tools/claude/install.sh` that installs the `claude` CLI. This is the *only* file that owns the `@anthropic-ai/claude-code` dependency now.
+- `docker-compose.yml` builds from `Dockerfile.generated` instead of `Dockerfile`. `Dockerfile.generated` is gitignored as a build artifact.
+- `nanogent init` auto-runs build at the end so fresh installs are immediately docker-ready.
+- `nanogent start --docker` auto-runs build if `Dockerfile.generated` is missing — so one-shot docker starts on a fresh checkout "just work".
+
+```bash
+# 1. Update nanogent
+npm install -g nanogent@latest
+
+# 2. Run the update. Plugin files (including the new tools/claude/install.sh)
+#    are dropped in if missing, or preserved if you've edited them locally.
+#    The base Dockerfile and docker-compose.yml are code files and will be
+#    overwritten — that's what you want.
+nanogent update
+
+# 3. Regenerate Dockerfile.generated with the new install step.
+nanogent build
+
+# 4. Restart (docker mode rebuilds the image from the generated Dockerfile).
+nanogent start
+```
+
+**Breaking changes for docker users:** the image tag has to be rebuilt because the Dockerfile shape changed. `nanogent start --docker` passes `--build` to compose, so `nanogent start` handles it automatically.
+
+**Breaking changes for node-mode users:** none. `install.sh` files only run inside the docker image. If you're running nanogent as a plain node process, you're still responsible for having the `claude` CLI installed on the host (same as before 0.8.0).
+
+**Philosophical notes:**
+
+- The core Dockerfile is *open for extension, closed for modification*. Adding a new tool that needs `go`, `rust`, `pandoc`, or a Python wheel means shipping an `install.sh` in the plugin folder, not editing core.
+- Plugin `install.sh` runs as root during `docker compose build`. This is a meaningful trust surface — only install plugins whose `install.sh` you would be comfortable running as root inside your build context.
+- `Dockerfile.generated` is a derived artifact, like `package-lock.json` for Docker. It's content-addressed by plugin discovery order (fixed: `tools`, `channels`, `providers`, `history`, `memory`, `scheduler`) so Docker's layer cache survives across unrelated plugin additions.
+- Build is pure file-generation — no docker daemon needed. Safe to run on any host, including ones that will only ever use node mode.
+
+See [DESIGN.md DR-011](DESIGN.md#dr-011-plugins-inject-container-dependencies-via-installsh) for the full rationale and plugin-author checklist.
 
 Once running, a client just sends any text to the bot. The chat agent:
 

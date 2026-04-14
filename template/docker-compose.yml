@@ -1,6 +1,12 @@
 services:
   nanogent:
-    build: .
+    build:
+      context: .
+      # Dockerfile.generated is produced by `nanogent build` from the base
+      # Dockerfile plus each plugin's optional install.sh. It is gitignored
+      # and regenerated on demand; edit Dockerfile (the base) to change the
+      # image, and add install.sh files to plugins to layer in dependencies.
+      dockerfile: Dockerfile.generated
     container_name: nanogent
     restart: unless-stopped
     env_file: .env

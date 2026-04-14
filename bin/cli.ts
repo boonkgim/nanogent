@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import {
-  copyFileSync, existsSync, mkdirSync, readFileSync, readSync, rmSync,
+  chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync,
+  readSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -15,6 +16,7 @@ const usage = `
 nanogent — per-project chat agent with pluggable tools, channels, and providers
 
   nanogent init             drop everything into .nanogent/ (runtime, prompt, config, contacts, tool, channel, provider)
+  nanogent build            regenerate .nanogent/Dockerfile.generated from the base Dockerfile + plugin install.sh files
   nanogent start            run the listener — reads .nanogent/config.json to choose node or docker mode
   nanogent start --docker   force docker mode (ignores config.json)
   nanogent start --node     force node mode (ignores config.json)
@@ -79,6 +81,7 @@ export const MANIFEST: ManifestEntry[] = [
   // Default tool (customisable, but update if unmodified)
   { src: 'tools/claude/index.ts',  dest: '.nanogent/tools/claude/index.ts',  type: 'plugin' },
   { src: 'tools/claude/README.md', dest: '.nanogent/tools/claude/README.md', type: 'plugin' },
+  { src: 'tools/claude/install.sh', dest: '.nanogent/tools/claude/install.sh', type: 'plugin' },
   { src: 'tools/claude/gitignore', dest: '.nanogent/tools/claude/.gitignore', type: 'plugin' },  // same npm workaround
 
   // Default channel
@@ -235,6 +238,146 @@ export function runUpdate(opts: UpdateOptions): UpdateCounts {
   return counts;
 }
 
+// ---------------------------------------------------------------------------
+// nanogent build — compose Dockerfile.generated from base + plugin install.sh
+// ---------------------------------------------------------------------------
+//
+// The core Dockerfile ships only the base image and apt baseline; every
+// container-side dependency a plugin needs lives next to that plugin as an
+// install.sh. `nanogent build` walks the plugin tree, finds every install.sh,
+// and splices matching COPY + RUN lines into the marker slot in the base
+// Dockerfile. The result lands at .nanogent/Dockerfile.generated, which is
+// what docker-compose.yml builds from.
+//
+// This keeps the core closed for modification: swapping tools/claude for a
+// tools/opencode plugin ships the right dependency without anyone editing
+// the base Dockerfile.
+
+/** Directories under .nanogent/ whose immediate children are plugin folders. */
+const PLUGIN_ROOTS = [
+  'tools', 'channels', 'providers', 'history', 'memory', 'scheduler',
+] as const;
+
+const BUILD_MARKER = '# __NANOGENT_PLUGIN_INSTALLS__';
+const BASE_DOCKERFILE_REL = '.nanogent/Dockerfile';
+const GENERATED_DOCKERFILE_REL = '.nanogent/Dockerfile.generated';
+
+export interface PluginInstall {
+  /** Plugin root directory, e.g. 'tools'. */
+  root: string;
+  /** Plugin folder name, e.g. 'claude'. */
+  name: string;
+  /** Path relative to .nanogent/, e.g. 'tools/claude/install.sh'. */
+  scriptPath: string;
+}
+
+export interface BuildOptions {
+  cwd?: string;
+  logger?: (msg: string) => void;
+}
+
+export interface BuildResult {
+  /** Absolute path of the file we wrote. */
+  outputPath: string;
+  /** Plugins that contributed an install step. */
+  installs: PluginInstall[];
+}
+
+/**
+ * Scan .nanogent/<root>/*\/install.sh and return a stable-ordered list.
+ * Stable ordering matters because the generated Dockerfile is content-addressed
+ * by Docker's layer cache — reshuffling would bust the cache for no reason.
+ */
+export function discoverPluginInstalls(nanogentDir: string): PluginInstall[] {
+  const installs: PluginInstall[] = [];
+  for (const root of PLUGIN_ROOTS) {
+    const rootDir = join(nanogentDir, root);
+    if (!existsSync(rootDir)) continue;
+    const entries = readdirSync(rootDir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('_') && !e.name.startsWith('.'))
+      .map(e => e.name)
+      .sort();
+    for (const name of entries) {
+      const script = join(rootDir, name, 'install.sh');
+      if (!existsSync(script)) continue;
+      installs.push({ root, name, scriptPath: `${root}/${name}/install.sh` });
+    }
+  }
+  return installs;
+}
+
+/** Emit the COPY + RUN pair for a single plugin install. */
+function renderInstallBlock(install: PluginInstall): string {
+  const containerPath = `/tmp/nanogent-install/${install.scriptPath}`;
+  return [
+    `# ${install.root}/${install.name}`,
+    `COPY ${install.scriptPath} ${containerPath}`,
+    `RUN bash ${containerPath}`,
+  ].join('\n');
+}
+
+/**
+ * Splice plugin install blocks into the base Dockerfile in place of the
+ * marker line. Throws if the marker is missing — a silent omission would
+ * leave users wondering why their plugin deps never make it into the image.
+ */
+export function composeDockerfile(baseContent: string, installs: PluginInstall[]): string {
+  if (!baseContent.includes(BUILD_MARKER)) {
+    throw new Error(
+      `base Dockerfile is missing the '${BUILD_MARKER}' marker line. ` +
+      'Restore it (see the shipped template/Dockerfile) or `nanogent build` ' +
+      'has nowhere to inject plugin install steps.',
+    );
+  }
+
+  const header = [
+    '# Generated by `nanogent build` — do not edit.',
+    '# Source: .nanogent/Dockerfile + plugin install.sh files.',
+    installs.length > 0
+      ? `# Plugins contributing install steps: ${installs.map(i => `${i.root}/${i.name}`).join(', ')}`
+      : '# No plugins contributed install steps.',
+  ].join('\n');
+
+  const body = installs.length > 0
+    ? installs.map(renderInstallBlock).join('\n\n')
+    : '# (no plugin install.sh files found — base image is used as-is)';
+
+  return baseContent.replace(BUILD_MARKER, `${header}\n\n${body}`);
+}
+
+/**
+ * Run the build: read the base Dockerfile, discover plugin installs, write
+ * Dockerfile.generated. Returns the list of contributing plugins so callers
+ * (init, start --docker) can log what got baked in.
+ */
+export function runBuild(opts: BuildOptions = {}): BuildResult {
+  const cwd = opts.cwd ?? process.cwd();
+  const log = opts.logger ?? ((msg: string) => { console.log(msg); });
+
+  const basePath = join(cwd, BASE_DOCKERFILE_REL);
+  if (!existsSync(basePath)) {
+    throw new Error(`${BASE_DOCKERFILE_REL} not found — run \`nanogent init\` first`);
+  }
+
+  const baseContent = readFileSync(basePath, 'utf8');
+  const installs = discoverPluginInstalls(join(cwd, '.nanogent'));
+  const generated = composeDockerfile(baseContent, installs);
+
+  const outputPath = join(cwd, GENERATED_DOCKERFILE_REL);
+  writeFileSync(outputPath, generated);
+
+  if (installs.length === 0) {
+    log('built:      .nanogent/Dockerfile.generated (no plugin install.sh found)');
+  } else {
+    log(`built:      .nanogent/Dockerfile.generated (${installs.length} plugin install step${installs.length === 1 ? '' : 's'})`);
+    for (const i of installs) {
+      log(`  + ${i.root}/${i.name}/install.sh`);
+    }
+  }
+
+  return { outputPath, installs };
+}
+
 /** Read .nanogent/config.json if present, return empty object otherwise. */
 function readConfig(): { docker?: boolean } {
   try {
@@ -264,6 +407,18 @@ if (!invokedDirectly) {
   // Imported as a module (e.g. from tests). Skip top-level CLI work.
 } else if (cmd === 'init') {
   copyFromManifest(MANIFEST);
+  // npm pack discards the executable bit, so restore it on any install.sh
+  // the manifest just laid down. Matches the approach we already use for
+  // .gitignore (shipped as `gitignore`, renamed on install).
+  for (const { dest } of MANIFEST) {
+    if (dest.endsWith('/install.sh')) {
+      try { chmodSync(join(process.cwd(), dest), 0o755); } catch { /* best-effort */ }
+    }
+  }
+  // Seed Dockerfile.generated so `nanogent start --docker` works on a fresh
+  // init without an extra step. The build is pure file-gen (no docker
+  // needed), so this is safe on any host.
+  try { runBuild(); } catch (e) { console.error(`build warning: ${(e as Error).message}`); }
   console.log([
     '',
     'next:',
@@ -273,6 +428,17 @@ if (!invokedDirectly) {
     '  $EDITOR .nanogent/prompt.md      # tailor the system prompt for this project / client',
     '  nanogent start',
   ].join('\n'));
+} else if (cmd === 'build') {
+  if (!existsSync(join(process.cwd(), '.nanogent'))) {
+    console.error('.nanogent/ not found — run `nanogent init` first');
+    process.exit(1);
+  }
+  try {
+    runBuild();
+  } catch (e) {
+    console.error(`build failed: ${(e as Error).message}`);
+    process.exit(1);
+  }
 } else if (cmd === 'start') {
   // Mode selection: explicit flag > config.json > node default
   const explicitDocker = args.includes('--docker');
@@ -287,6 +453,18 @@ if (!invokedDirectly) {
     if (!existsSync(composePath)) {
       console.error('.nanogent/docker-compose.yml not found — run `nanogent init` first');
       process.exit(1);
+    }
+    // Auto-build Dockerfile.generated on first docker start, or after an
+    // update that bumped the base but didn't touch plugin installs. Cheap
+    // file-gen; docker-compose then does the real image build.
+    const generatedPath = join(process.cwd(), '.nanogent', 'Dockerfile.generated');
+    if (!existsSync(generatedPath)) {
+      try {
+        runBuild();
+      } catch (e) {
+        console.error(`build failed: ${(e as Error).message}`);
+        process.exit(1);
+      }
     }
     spawn('docker', ['compose', '-f', composePath, 'up', '--build'], { stdio: 'inherit' })
       .on('exit', c => { process.exit(c ?? 0); });

@@ -12,3 +12,9 @@
 # manages its own state and ships its own .gitignore if it wants anything
 # in its folder ignored.
 /state/
+
+# Build artifact. Produced by `nanogent build` from the base Dockerfile +
+# every plugin's optional install.sh. Regenerate with `nanogent build`;
+# committing it would couple the repo to whichever plugin set happened to
+# be installed on one machine.
+/Dockerfile.generated

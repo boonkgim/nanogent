@@ -16,6 +16,7 @@ Versions referenced:
 - **v0.4.x → v0.5.0** — Runtime converted to TypeScript (single hand-written `.ts` file, Node 24+ type stripping).
 - **v0.5.0** — History and memory extracted into separate plugin directories. History store is the raw append-only log; memory is the indexer/retriever. Both are exactly-one-active. See [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern) and [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
 - **v0.7.0** — Scheduler introduced as an optional (zero-or-one) plugin type. Time-based proactive triggers are now a first-class concern: the agent manages schedules conversationally via the bundled `schedule` tool, a core tick loop fires due schedules through the shared `fireSystemTurn` entry point, and execution state is stored as an append-only log separate from the rules file. See [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-source).
+- **v0.8.0** — Container dependencies made pluggable. The core `Dockerfile` becomes a base stub with a marker line; each plugin can ship an optional `install.sh` next to its `index.ts`, and a new `nanogent build` CLI command composes the real `Dockerfile.generated` by splicing every plugin's install step into the base. The `@anthropic-ai/claude-code` install moves out of core and into `tools/claude/install.sh` — swapping in a different coding harness (e.g. `tools/opencode/`) no longer requires editing the core Dockerfile. See [DR-011](#dr-011-plugins-inject-container-dependencies-via-installsh).
 
 ## Architecture at a glance
 
@@ -629,6 +630,60 @@ Read [DR-010](#dr-010-scheduler-is-an-optional-pluggable-proactive-trigger-sourc
 - [ ] Treat `contactId`, `channel`, and `chatId` on `ScheduleSpec` as opaque strings — they're routing metadata, not schedule identity. Do not parse them.
 - [ ] Log failures but don't throw out of methods that the core calls in a tight loop (`claimDue` especially). A scheduler plugin that throws every tick will just spam logs; one that logs and returns an empty result degrades gracefully.
 
+### DR-011: Plugins inject container dependencies via `install.sh`
+
+**Status:** Accepted (v0.8.0)
+
+**Context:** Until v0.7.0, the core `template/Dockerfile` hard-coded `npm install -g @anthropic-ai/claude-code` alongside the base image setup. This baked the identity of one specific plugin (`tools/claude`) directly into a file labelled "core": swapping `tools/claude` for a hypothetical `tools/opencode` — or removing the coding-harness tool entirely because a user wanted a pure-RAG bot — required editing core. That's a textbook Open/Closed violation: core should be closed for modification and open for extension, but the Dockerfile was neither.
+
+The tool plugin system already solves this for *runtime* dependencies: swap out a plugin folder and the runtime picks up the replacement. But the Dockerfile lives a layer below the runtime, and the runtime has no influence over what the image contains. Anything a plugin needs *installed in the image* was a core concern by default, and that coupled every container-using install to whatever happened to be the v0.7.0 default tool set.
+
+This problem generalises beyond `tools/claude`. Different coding harnesses need different CLIs (`claude`, `opencode`, `aider`, `cursor-agent`). A `rag/pgvector` memory plugin needs `postgresql-client`. A `channels/whatsapp` plugin might need `libwebp`. A `providers/local-llm` plugin wants `ollama`. None of these should require touching core.
+
+**Decision:** Make container dependencies pluggable via a new file-level convention: any plugin folder may optionally ship an `install.sh` next to its `index.ts`. A new `nanogent build` CLI command walks every plugin folder under `.nanogent/{tools,channels,providers,history,memory,scheduler}/`, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into a base Dockerfile marker, producing `.nanogent/Dockerfile.generated`. `docker-compose.yml` builds from the generated file, not the base. `nanogent init` auto-runs the build; `nanogent start --docker` re-runs it if the generated file is missing.
+
+**What:**
+
+- `template/Dockerfile` is reduced to: `FROM node:24-slim`, a minimal apt baseline (`git`, `ca-certificates`), the `# __NANOGENT_PLUGIN_INSTALLS__` marker, `WORKDIR`, and `CMD`. No plugin-specific installs.
+- `template/tools/claude/install.sh` owns `npm install -g @anthropic-ai/claude-code`. This is the only file in the repo that knows about the claude CLI dependency.
+- `nanogent build` reads the base Dockerfile, scans plugin folders in `PLUGIN_ROOTS` declaration order (`tools`, `channels`, `providers`, `history`, `memory`, `scheduler`) with alphabetical plugin-name sort within each root, and writes `.nanogent/Dockerfile.generated`. Stable ordering protects Docker's layer cache.
+- Each found `install.sh` emits one block: a comment, a `COPY <rel>/install.sh /tmp/nanogent-install/<rel>/install.sh`, and a `RUN bash /tmp/nanogent-install/<rel>/install.sh`. Docker's build context is already `.nanogent/` (because compose lives inside it with `context: .`), so plugin paths resolve directly.
+- `.nanogent/Dockerfile.generated` is gitignored as a build artifact, analogous to `package-lock.json` for Docker. The base `Dockerfile` is committed; the generated file is not.
+- `nanogent init` runs build at the end of init so fresh installs are immediately docker-ready. `nanogent start --docker` runs build if the generated file is missing so one-shot docker starts on fresh checkouts "just work".
+- If the base Dockerfile is missing the marker line, build fails loudly — a silent omission would leave the operator wondering why plugin deps never made it into the image.
+
+**Why:**
+
+- **OCP compliance** — the core Dockerfile no longer knows which plugins are installed. Adding or removing `tools/claude` is now purely a plugin operation; no core edit is required.
+- **Co-locates the dependency with the code that needs it** — the claude tool's runtime code (`tools/claude/index.ts`) and its install script (`tools/claude/install.sh`) live in the same folder. Future plugin authors find them together, reason about them together, and delete them together.
+- **Fail-loud over fail-silent** — a plugin that needs a CLI but doesn't ship an `install.sh` fails visibly at runtime (`claude: command not found`) rather than invisibly masking the dependency. The convention creates a natural slot for the dependency declaration.
+- **Pure file generation, no docker daemon needed** — `nanogent build` can run on any host, including node-mode-only hosts that will never touch docker. Safe to auto-run at init time.
+- **Preserves layer caching** — stable discovery order (root declaration order, then alphabetical within root) means adding an unrelated plugin doesn't invalidate cached layers for existing ones.
+- **Convention over API** — `install.sh` is a shell script, not a metadata JSON with an `apt` + `npm` + `pip` schema. A shell script is the maximally general contract: apt installs, npm installs, pip installs, curl-to-sh vendor installers, file downloads, and chmods all fit inside one `bash` invocation with no core changes. It trades a slightly larger trust surface (arbitrary root commands during build) for zero core coupling to package-manager choice.
+
+**Consequences:**
+
+- **Plugin install.sh runs as root during `docker compose build`.** This is a meaningful trust surface — installing an untrusted plugin means running its `install.sh` as root inside your build context. Plugin authors should keep install scripts minimal and auditable. Operators should treat third-party plugin installs with the same caution they'd apply to any `curl | bash` — because that's what it is.
+- **A new manual step exists for docker users: `nanogent build` after adding/removing/editing plugin `install.sh` files.** `nanogent start --docker` only auto-runs build when the generated file is *missing*, not when it's stale. Running build manually after plugin changes is the contract; stale-detection (hashing plugin contents) would add complexity for marginal benefit.
+- **Trust asymmetry with pure runtime plugins.** Before v0.8.0, a tool plugin could only execute code inside `runTurn` (sandboxed by the tool invocation lifecycle and the permission model). A plugin with an `install.sh` executes code during image build *before* any permission check. Nothing in core mitigates this — it's inherent to the "let plugins modify the image" goal.
+- **Node-mode users are unaffected.** `install.sh` files only run inside the docker image. Running nanogent as a plain node process means host-level dependencies (`claude` on PATH, `node >= 24`, etc.) remain the operator's responsibility — same as before 0.8.0.
+- **Build output is not a new plugin type.** It's a convention applied to existing plugin types. The six plugin-type extensibility points (tool, channel, provider, history, memory, scheduler) stay at six. Every plugin can opt in via `install.sh`; none have to.
+- **The base Dockerfile is still customisable.** Operators who need a different FROM image, extra baseline apt packages, locale settings, or non-root users edit `.nanogent/Dockerfile` (which is `type: code` in the update manifest, so it's overwritten on update — re-apply local changes after `nanogent update`). The marker line must stay intact.
+- **Resource requirements (memory, CPU, GPU) are not covered by this decision.** `install.sh` only controls what's *installed* in the image. Compose-level resource limits (`mem_limit`, `cpus`, GPU passthrough) remain operator-owned in `.nanogent/docker-compose.yml`. Making per-plugin resource declarations pluggable is a separate decision — see *Out of scope* below.
+
+**Checklist for plugin authors adding an `install.sh`:**
+
+- [ ] Place the file at `<plugin-root>/<name>/install.sh` next to `index.ts`
+- [ ] Start with `#!/usr/bin/env bash` and `set -euo pipefail` — fail fast on install errors
+- [ ] Keep it minimal and auditable — plugin operators will read this before trusting your plugin
+- [ ] Prefer idempotent steps (`apt-get install -y` is already idempotent; guard vendor installers with `command -v X >/dev/null || ...` where possible)
+- [ ] Do not rely on `.nanogent/` being present inside the image — the install script runs in a bare build context with only the script itself copied in. Any runtime files your plugin needs live under its plugin folder and are visible at runtime, not install time.
+- [ ] Pin versions when stability matters (`npm install -g pkg@1.2.3`), accept latest only when the plugin author is willing to own the churn
+- [ ] Do not write to plugin folders from `install.sh` — those files don't persist past the RUN layer, and state should live under `ctx.stateDir` at runtime anyway
+- [ ] Document what gets installed in the plugin's README so operators know what they're opting into
+- [ ] Leave executable bit set (`chmod +x install.sh`) before committing; npm pack strips it, so the CLI re-chmods on init, but git needs it
+- [ ] Run `nanogent build` yourself and confirm the generated COPY + RUN lines look right before pushing a plugin update
+
 ### Email plugin — specific guidance
 
 See [DR-004](#dr-004-email-channel-should-use-per-thread-chatids-with-shared-history). Quick summary:
@@ -665,5 +720,6 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 - **0.1 (2026-04-14)** — Initial draft capturing decisions from the v0.4.0 design discussion. Channels and providers as plugins; permission model via `contacts.json`; email guidance; historyMode semantics.
 - **0.2 (2026-04-14)** — Added DR-009a (history storage is a separate pluggable raw log) and DR-009b (memory is a separate pluggable indexer/retriever). Captures the v0.5.0 split of history and memory into two exactly-one-active plugin directories, the recall/append/retractLast/clear contract, `systemContext` in `RecallResult`, cache-control placement guidance, and the "history is source of truth, memory is recoverable" consistency model.
 - **0.3 (2026-04-15)** — Added DR-010 (scheduler is an optional pluggable proactive trigger source). Captures the v0.7.0 introduction of an optional zero-or-one scheduler plugin type, the 9-method `SchedulerPlugin` contract (definition CRUD + claimDue/markComplete/markFailed + listExecutions), the core-owned `fireSystemTurn` helper as the single entry point for non-user-initiated turns, the once-a-minute tick loop, the definitions-vs-execution-log split in the bundled `scheduler/jsonl` default, and the rationale for keeping definitions/execution in a single plugin while keeping the scheduler itself optional.
+- **0.4 (2026-04-15)** — Added DR-011 (plugins inject container dependencies via install.sh). Captures the v0.8.0 move of container-side installs out of the core Dockerfile and into per-plugin `install.sh` scripts composed by `nanogent build` into `Dockerfile.generated`, the rationale (OCP — swapping `tools/claude` for a hypothetical `tools/opencode` no longer requires editing the core Dockerfile), the stable discovery order for layer-cache stability, the root-execution trust surface it introduces during `docker compose build`, and the explicit deferral of per-plugin compose-level resource requirements (`mem_limit`, `cpus`, GPU passthrough) to a future decision.
 
 When adding a new decision or updating an existing one, add a line here with the date and a one-sentence summary.
