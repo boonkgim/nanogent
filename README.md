@@ -715,6 +715,39 @@ npm test             # node:test against tests/
 - **Tests use `node:test`** (built into Node) plus real temp directories via `fs.mkdtempSync`. No mocking framework, no test runner dependency.
 - **Pure helpers are exported from `template/nanogent.ts`** for testability: `findChat`, `resolveAccess`, `rotateHistory`, `isTurnStart`, `loadEnv`, `loadConfig`, `loadContacts`. The file is side-effect-free on import — actual runtime bootstrap only happens when the file is executed directly, so tests can import it cleanly.
 
+### Runtime testing against a live Telegram bot
+
+`npm test` covers the pure helpers, but it doesn't actually boot the runtime or talk to Telegram / Anthropic. When you're iterating on the core loop, a plugin, or a prompt change and you want to exercise the real thing end-to-end, set up a scratch project outside the repo with symlinks back into `template/` so edits take effect on restart without a copy step.
+
+The runtime hardcodes paths under `.nanogent/` relative to `process.cwd()`, so there's no way to run `template/nanogent.ts` in place — you need a directory containing a `.nanogent/` folder to launch from.
+
+```bash
+mkdir -p /tmp/ng-dev/.nanogent && cd /tmp/ng-dev
+REPO=~/codes/nanogent/template
+
+# Symlink code + plugin dirs so template/ edits are picked up on restart
+ln -s $REPO/nanogent.ts .nanogent/nanogent.ts
+ln -s $REPO/types.d.ts  .nanogent/types.d.ts
+ln -s $REPO/tools       .nanogent/tools
+ln -s $REPO/channels    .nanogent/channels
+ln -s $REPO/providers   .nanogent/providers
+ln -s $REPO/history     .nanogent/history
+ln -s $REPO/memory      .nanogent/memory
+
+# Copy user-owned files so you can customise without dirtying the repo
+cp $REPO/prompt.md     .nanogent/prompt.md
+cp $REPO/config.json   .nanogent/config.json
+cp $REPO/contacts.json .nanogent/contacts.json
+cp $REPO/.env.example  .nanogent/.env   # then fill TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
+
+# Fill contacts.json with your own Telegram user + chat IDs, then:
+node .nanogent/nanogent.ts
+```
+
+Now you can edit anything under `template/` in your editor, Ctrl+C the process, relaunch, and the changes are live — no `nanogent update`, no copy step, no byte-compare skip. All mutable state (`.nanogent/state/`, history JSONL, memory files) lands in `/tmp/ng-dev/`, so the repo working tree stays clean. To reset: `rm -rf /tmp/ng-dev`.
+
+Use a **throwaway bot token** and a bot that only you can message. If you add a new file or plugin directory under `template/`, remember to add a matching symlink in the scratch dir.
+
 ## License
 
 [MIT](./LICENSE) © Khur Boon Kgim
