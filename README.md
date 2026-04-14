@@ -27,7 +27,11 @@ By default, nanogent ships with one tool: **`claude`**, which delegates coding t
 
 This is the **open/closed** split: the core is closed for modification; tools are open for extension. Adding a new tool is dropping one file. The core knows nothing about `claude`, `opencode`, `rag`, or anything else specific.
 
-## nanogent vs. Claude Code Channels
+## How nanogent compares
+
+nanogent sits in a crowded space. Here's where it lines up against the closest alternatives — and where it deliberately doesn't.
+
+### vs. Claude Code Channels
 
 Anthropic's [Claude Code Channels](https://code.claude.com/docs/en/channels) pushes messages into a **running** Claude Code session. It's the right tool when you're at your desk with Claude Code open. **nanogent covers the case it doesn't** — when nobody's at the keyboard, when the other end is a client rather than a developer, and when you want a conversational layer above the raw coding agent.
 
@@ -38,12 +42,28 @@ Anthropic's [Claude Code Channels](https://code.claude.com/docs/en/channels) pus
 | Permission prompts | **Pause remotely** | Bypassed via `--dangerously-skip-permissions` (allowlist gated) |
 | Deployable on a VPS / Raspberry Pi / headless box? | Awkward | Yes — `pm2 start nanogent.mjs` or `docker compose up -d` |
 | Client-facing? | Developer-only | Yes — chat agent handles small talk, skipping, clarification |
-| Extensibility | MCP servers | Drop-in `.mjs` tool files per project |
-| Moving parts | MCP server + pairing codes + session | One `.mjs` runtime + per-tool files + `.env` |
+| Extensibility | MCP servers | Drop-in folder tools per project |
+| Moving parts | MCP server + pairing codes + session | One `.mjs` runtime + per-tool folders + `.env` |
 | Supported channels | Telegram, Discord, iMessage | Telegram only, by design |
 
 **Use Channels** when you're coding interactively and want a chat-flavored remote for your live session.
 **Use nanogent** when you want a per-project assistant you can hand to a client, run on a VPS, or compose with custom tools.
+
+### vs. OpenClaw
+
+OpenClaw ships a full-featured agent gateway with built-in support for many channels, a plugin system, and its own coding execution layer. If you want all of that wired up out of the box, it's a defensible choice. But that choice comes with three costs nanogent refuses to pay:
+
+- **Bloat and audit surface.** You install code for every channel whether you use it or not. That's more surface to audit, more dependencies to maintain, and more attack surface if any channel has a vulnerability. nanogent ships one channel (Telegram) and one default tool; everything else is opt-in via drop-in folders.
+- **Centralised gateway creates coupling between projects.** One process owns every project, with a config mapping chat IDs → projects. Moving, duplicating, or removing a project means reconfiguring the gateway — there's no `rm -rf project/.nanogent` equivalent. nanogent is decentralised by design: one project, one listener, one lifecycle.
+- **Reinvents existing tools.** OpenClaw builds its own coding execution harness. nanogent prefers to **wrap** existing, well-maintained coding agents (`claude`, `opencode`, `codex`) as tools rather than reimplement them. The Claude Code team writes a better coding harness than we can; we let them.
+
+### vs. NanoClaw
+
+NanoClaw's core is refreshingly small — we agree with that. Where we diverge is its extension model. NanoClaw extends capability via **skills**: natural-language capability descriptions that the LLM interprets at runtime. nanogent takes a different position: **capabilities that have a correct answer should be code, not skills.**
+
+Running a CLI, checking a job status, reading a file, hitting an API with a known schema — these are deterministic tasks with exact inputs and exact outputs. Wrapping them in a natural-language skill description forces an LLM inference every time they fire, which wastes tokens, introduces probabilistic failure modes in places that should be rock-solid, and makes behaviour harder to test and audit. nanogent's tools are JavaScript modules with exact `input_schema` declarations — executed directly by the runtime, not interpreted by a model. The LLM only enters the picture for the routing decision ("is this message for us? which tool should I call? how should I explain the result?"), where probabilistic behaviour is actually the feature.
+
+That's the split: **code for the deterministic, LLMs for the probabilistic.** See the *Tools are code, not skills* design principle below for the positive framing.
 
 ## Design principles
 
@@ -59,7 +79,10 @@ The runtime is a single file (`.nanogent/nanogent.mjs`) with zero npm dependenci
 The whole install lives under `.nanogent/`. Nothing nanogent-related lives outside it — no symlinks, no system-wide state, no registry entries, no global npm package. Install is dropping a directory; uninstall is deleting one. Moving a project between machines is `cp -r .nanogent/`. If you're tempted to write state under `~/`, under `/etc/`, or in the user's project root, don't — put it in `.nanogent/`.
 
 **Open/closed core, pluggable tools.**
-The core runtime never changes to add capability. New tools are drop-in folders in `.nanogent/tools/<name>/` with a required `index.mjs` that default-exports `{ name, description, input_schema, execute }`. The core scans the tools directory at startup; it has no hardcoded knowledge of `claude`, `opencode`, `rag`, or any other specific tool. If you find yourself editing `nanogent.mjs` to support a new capability, stop — the capability is a tool, not a core change.
+The core runtime never changes to add capability. New tools are drop-in folders in `.nanogent/tools/<name>/` with a required `index.mjs` that default-exports `{ name, description, input_schema, execute }`. The core scans the tools directory at startup; it has no hardcoded knowledge of `claude`, `opencode`, `rag`, or any other specific tool. If you find yourself editing `nanogent.mjs` to support a new capability, stop — the capability is a tool, not a core change. And if the capability already exists as a well-maintained external tool (a coding agent, a search API, a scheduler), **wrap it rather than reimplement it** — the Claude Code team writes a better coding harness than we can, and the `claude` tool lets them.
+
+**Tools are code, not skills.**
+A tool's `execute` function is deterministic JavaScript with an exact `input_schema`, run directly by the runtime — not a natural-language description the LLM interprets at runtime. Capabilities with a correct answer (running a CLI, reading a file, hitting an API with a known schema) belong in code, where they're predictable, cheap to audit, and free of LLM inference. The LLM only decides *which tool to call and how to phrase the result* — that's where probabilistic behaviour is actually the feature. Everywhere else, it's a tax on both tokens and reliability.
 
 **Each tool is standalone.**
 A tool imports only from node stdlib and talks to the injected `ctx` — never from sibling tools, a shared helper file, or a tool SDK. Drop a tool folder into another project's `.nanogent/tools/` and it should just work. If you catch yourself wanting to share code between tools, copy it — don't extract it. Three similar files are better than a premature abstraction that won't fit the second implementation when it arrives.
