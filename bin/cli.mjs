@@ -28,6 +28,7 @@ in-chat commands (once running):
   /status   show the running job and queue depth
   /cancel   SIGTERM the running job
   /queue    list running + queued prompts
+  /clear    forget current session — next message starts fresh
 
 to stop:  Ctrl+C   (or: kill <pid> / pm2 stop / docker compose down)
 to remove: rm nanogent.mjs .nanogent.json .env [Dockerfile docker-compose.yml]

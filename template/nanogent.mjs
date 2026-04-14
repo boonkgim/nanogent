@@ -2,7 +2,7 @@
 // Zero dependencies. The chat agent never blocks: new messages (and /status,
 // /cancel, /queue) are always processed even while a Claude Code job is running.
 import { spawn } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
 
 const env = loadEnv('.env');
 const TOKEN = env.TELEGRAM_BOT_TOKEN;
@@ -53,11 +53,12 @@ async function handle(text, chatId) {
   if (text === '/status')   return showStatus(chatId);
   if (text === '/cancel')   return cancelJob(chatId);
   if (text === '/queue')    return showQueue(chatId);
+  if (text === '/clear')    return clearSession(chatId);
   if (text === '/help' || text === '/start') {
-    return tg('sendMessage', { chat_id: chatId, text: 'send any text to run in this project.\ncommands: /status /cancel /queue' });
+    return tg('sendMessage', { chat_id: chatId, text: 'send any text to run in this project.\ncommands: /status /cancel /queue /clear' });
   }
   if (text.startsWith('/')) {
-    return tg('sendMessage', { chat_id: chatId, text: 'unknown command. try /status /cancel /queue' });
+    return tg('sendMessage', { chat_id: chatId, text: 'unknown command. try /status /cancel /queue /clear' });
   }
 
   if (state.currentJob) {
@@ -96,6 +97,17 @@ function showQueue(chatId) {
   const cur = state.currentJob ? `▶ ${state.currentJob.prompt.slice(0, 80)}` : '(idle)';
   const q = state.queue.map((j, i) => `${i + 1}. ${j.prompt.slice(0, 80)}`).join('\n');
   return tg('sendMessage', { chat_id: chatId, text: `${cur}${q ? '\n' + q : ''}` });
+}
+
+function clearSession(chatId) {
+  if (state.currentJob) {
+    return tg('sendMessage', { chat_id: chatId, text: '⚠️ a job is running — /cancel first, then /clear' });
+  }
+  if (!existsSync(STATE)) {
+    return tg('sendMessage', { chat_id: chatId, text: '✨ already fresh — no session to clear' });
+  }
+  unlinkSync(STATE);
+  return tg('sendMessage', { chat_id: chatId, text: '✨ session cleared — next message starts fresh' });
 }
 
 function cancelJob(chatId) {

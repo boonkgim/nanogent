@@ -109,6 +109,7 @@ Once nanogent is running, send these to the bot:
 | `/status` | Show the currently running job and queue depth |
 | `/cancel` | SIGTERM the running job |
 | `/queue` | List running + queued prompts |
+| `/clear` | Forget the current session — next message starts a fresh `claude -p` (no `--continue`) |
 | `/help` | Show command list |
 
 While a job is running, new prompts are automatically **queued** and run FIFO. The chat agent never blocks — `/status` and `/cancel` respond instantly even mid-job.
