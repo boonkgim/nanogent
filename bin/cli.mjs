@@ -52,7 +52,8 @@ const MANIFEST = [
   { src: 'gitignore',          dest: '.nanogent/.gitignore' },   // npm strips .gitignore from packages, so ship it as `gitignore` and rename on install
   { src: 'Dockerfile',         dest: '.nanogent/Dockerfile' },
   { src: 'docker-compose.yml', dest: '.nanogent/docker-compose.yml' },
-  { src: 'tools/claude.mjs',   dest: '.nanogent/tools/claude.mjs' },
+  { src: 'tools/claude/index.mjs', dest: '.nanogent/tools/claude/index.mjs' },
+  { src: 'tools/claude/README.md', dest: '.nanogent/tools/claude/README.md' },
 ];
 
 function copyFromManifest(manifest) {

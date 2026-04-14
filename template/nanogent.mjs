@@ -242,6 +242,8 @@ async function onJobComplete(jobId, status, result) {
 
 /** @type {Map<string, any>} Tool name → tool module (default export) */
 const tools = new Map();
+/** @type {Map<string, string>} Plugin tool name → absolute folder path (for ctx.toolDir). */
+const toolDirs = new Map();
 
 async function loadTools() {
   // Core tools (built into the runtime — not in .nanogent/tools/)
@@ -273,21 +275,29 @@ async function loadTools() {
     },
   });
 
-  // Plugin tools from .nanogent/tools/
+  // Plugin tools from .nanogent/tools/ — one folder per tool, each with a required index.mjs.
   if (existsSync(TOOLS_DIR)) {
-    for (const file of readdirSync(TOOLS_DIR)) {
-      if (!file.endsWith('.mjs') || file.startsWith('_')) continue;
+    for (const entry of readdirSync(TOOLS_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('_')) continue; // scratch / wip space
+      const toolDir = resolve(TOOLS_DIR, entry.name);
+      const indexPath = resolve(toolDir, 'index.mjs');
+      if (!existsSync(indexPath)) {
+        log(`tool ${entry.name}: missing index.mjs, skipping`);
+        continue;
+      }
       try {
-        const mod = await import(pathToFileURL(resolve(TOOLS_DIR, file)).href);
+        const mod = await import(pathToFileURL(indexPath).href);
         const t = mod.default;
         if (!t?.name || typeof t.execute !== 'function') {
-          log(`tool ${file}: invalid shape, skipping`);
+          log(`tool ${entry.name}: invalid shape (needs default export { name, execute }), skipping`);
           continue;
         }
         tools.set(t.name, t);
-        log(`loaded tool: ${t.name} (${file})`);
+        toolDirs.set(t.name, toolDir);
+        log(`loaded tool: ${t.name} (${entry.name}/index.mjs)`);
       } catch (e) {
-        log(`tool ${file}: load error`, e?.message || e);
+        log(`tool ${entry.name}: load error`, e?.message || e);
       }
     }
   }
@@ -308,7 +318,7 @@ function toolSchemas() {
 }
 
 /** Returns tool_result content (string) or { skip: true } for the 'skip' core tool. */
-async function executeTool(name, input, ctx) {
+async function executeTool(name, input, chatId) {
   const tool = tools.get(name);
   if (!tool) return `error: unknown tool '${name}'`;
 
@@ -317,7 +327,8 @@ async function executeTool(name, input, ctx) {
   if (name === 'cancel_job')        return coreCancelJob();
   if (name === 'learn')             return coreLearn(input);
 
-  // Plugin tool
+  // Plugin tool — build a fresh ctx with this tool's own folder.
+  const ctx = makeToolCtx(chatId, toolDirs.get(name));
   try {
     const res = await tool.execute(input || {}, ctx);
     if (res?.async && res?.jobId) {
@@ -418,10 +429,9 @@ async function runTurn(chatId) {
     }
 
     const toolResults = [];
-    const ctx = makeToolCtx(chatId);
     for (const block of response.content) {
       if (block.type !== 'tool_use') continue;
-      const result = await executeTool(block.name, block.input || {}, ctx);
+      const result = await executeTool(block.name, block.input || {}, chatId);
       toolResults.push({
         type: 'tool_result',
         tool_use_id: block.id,
@@ -459,9 +469,10 @@ async function runTurn(chatId) {
 // Tool context (passed to plugin tools)
 // ---------------------------------------------------------------------------
 
-function makeToolCtx(chatId) {
+function makeToolCtx(chatId, toolDir) {
   return {
     projectDir: process.cwd(),
+    toolDir,                // absolute path to this tool's folder — read sibling files from here
     chatId,
     sendMessage: text => tg('sendMessage', { chat_id: chatId, text: truncate(text) }),
     editMessage: (messageId, text) =>

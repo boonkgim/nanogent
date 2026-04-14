@@ -2,7 +2,7 @@
 
 A **per-project chat agent** reachable via Telegram, with pluggable tools. Zero npm dependencies. Decentralised by design — every project gets its own listener, its own prompt, its own tool set, its own lifecycle. The whole install lives in **one directory (`.nanogent/`)** you can commit, copy between projects, or delete wholesale.
 
-By default, nanogent ships with one tool: **`claude`**, which delegates coding tasks to [Claude Code](https://docs.claude.com/claude-code). You can add more tools (`rag`, `search`, `opencode`, etc.) by dropping `.mjs` files into `.nanogent/tools/` — the core runtime never needs to change.
+By default, nanogent ships with one tool: **`claude`**, which delegates coding tasks to [Claude Code](https://docs.claude.com/claude-code). You can add more tools (`rag`, `search`, `opencode`, etc.) by dropping a folder into `.nanogent/tools/` — the core runtime never needs to change.
 
 ```
 ┌─────────┐     ┌────────────────────────────────────────┐      ┌─────────────┐
@@ -23,7 +23,7 @@ By default, nanogent ships with one tool: **`claude`**, which delegates coding t
 ## Two layers, one file per tool
 
 - **Chat agent (core, `nanogent.mjs`)** — runs a small Anthropic API loop (Claude Haiku by default) to decide whether to answer the client directly, `skip` side chatter, `learn` a preference, `check_job_status`, `cancel_job`, or delegate to a project-specific tool.
-- **Tools (`.nanogent/tools/*.mjs`)** — one file per capability. Each tool exports `{ name, description, input_schema, execute(input, ctx) }`. Long-running tools return `{ async: true, jobId }` immediately and keep the chat agent responsive while they run. When a job finishes, a synthetic `[SYSTEM]` message is injected into the conversation and the chat agent decides how to tell the client.
+- **Tools (`.nanogent/tools/<name>/`)** — one folder per capability, each with a required `index.mjs` that default-exports `{ name, description, input_schema, execute(input, ctx) }`. Long-running tools return `{ async: true, jobId }` immediately and keep the chat agent responsive while they run. When a job finishes, a synthetic `[SYSTEM]` message is injected into the conversation and the chat agent decides how to tell the client.
 
 This is the **open/closed** split: the core is closed for modification; tools are open for extension. Adding a new tool is dropping one file. The core knows nothing about `claude`, `opencode`, `rag`, or anything else specific.
 
@@ -182,7 +182,21 @@ mv .env .nanogent/.env   # or just copy the keys over
 # your .nanogent/state/history.jsonl + learnings.md are preserved as-is
 ```
 
-## How clients talk to it
+### Migrating from 0.3.0
+
+v0.3.1 changed tools from single `.mjs` files to folders containing an `index.mjs`, so each tool can own its own README, helpers, and assets. To migrate an existing 0.3.0 install:
+
+```bash
+cd .nanogent/tools
+for f in *.mjs; do
+  [ -e "$f" ] || continue
+  name="${f%.mjs}"
+  mkdir "$name"
+  mv "$f" "$name/index.mjs"
+done
+```
+
+Your chat history, learnings, prompt, and config are unaffected.
 
 Once running, a client just sends any text to the bot. The chat agent:
 
@@ -206,7 +220,22 @@ Slash commands are cheap and instant (no LLM call); they operate directly on the
 
 ## Adding a tool
 
-A tool is a single `.mjs` file in `.nanogent/tools/` that default-exports this shape:
+A tool is a **folder** in `.nanogent/tools/` with one required file: `index.mjs`. Everything else in the folder — helpers, assets, schemas, README, tests — is the tool's own business.
+
+```
+.nanogent/tools/
+  claude/
+    index.mjs        ← REQUIRED. Default-exports the tool object.
+    README.md        ← recommended — setup notes, API keys, example invocations.
+  rag/               ← example of a folder-shaped tool that outgrew one file
+    index.mjs
+    README.md
+    chunker.mjs      ← helpers the tool imports via normal relative imports
+    schemas/
+      answer.json
+```
+
+Minimum viable tool — `rag/index.mjs`:
 
 ```js
 export default {
@@ -245,11 +274,24 @@ async execute({ prompt, title }, ctx) {
 },
 ```
 
+**Reading sibling files** (assets, schemas, cached indexes) uses `ctx.toolDir`:
+
+```js
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+async execute({ query }, ctx) {
+  const schema = JSON.parse(readFileSync(join(ctx.toolDir, 'schemas/answer.json'), 'utf8'));
+  // ... use schema
+}
+```
+
 What `ctx` provides:
 
 | | |
 |---|---|
-| `ctx.projectDir` | The project root (cwd) |
+| `ctx.projectDir` | Project root (cwd) — this is where the shell runs tools like `claude -p` |
+| `ctx.toolDir` | Absolute path to *this tool's* folder — read sibling files from here |
 | `ctx.chatId` | Telegram chat the request came from |
 | `ctx.sendMessage(text)` | Post a new Telegram message |
 | `ctx.editMessage(msgId, text)` | Edit a message the tool previously sent |
@@ -258,7 +300,7 @@ What `ctx` provides:
 | `ctx.busy()` | Returns `null` or the currently-running job descriptor |
 | `ctx.log(...)` | Scoped logger |
 
-Tools are discovered at startup by globbing `.nanogent/tools/*.mjs`. Files starting with `_` are ignored (useful for helpers). No manifest, no config — drop a file, restart, it's loaded.
+Tools are discovered at startup by scanning `.nanogent/tools/` for directories. Each directory must contain an `index.mjs` that default-exports `{ name, description, input_schema, execute }` — if the file is missing or the shape is wrong, the tool is skipped with a log line. Directories starting with `_` are ignored (scratch / wip space). No manifest, no config file, no naming rules beyond `index.mjs` — drop a folder, restart, it's loaded.
 
 ## How it works
 
