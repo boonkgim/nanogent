@@ -1,6 +1,6 @@
 {
   "name": "nanogent",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Per-project chat agent reachable via Telegram, with pluggable tools. Default tool delegates to Claude Code; additional tools are drop-in .mjs files.",
   "type": "module",
   "bin": {

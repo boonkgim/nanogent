@@ -12,60 +12,73 @@ const here = dirname(fileURLToPath(import.meta.url));
 const tplDir = join(here, '..', 'template');
 
 const usage = `
-nanogent — per-project chat agent with pluggable tools, reachable via Telegram
+nanogent — per-project chat agent with pluggable tools, channels, and providers
 
-  nanogent init           drop everything into .nanogent/ (node + docker files, plus prompt, config, tools)
-  nanogent start          run the listener — reads .nanogent/config.json to choose node or docker mode
-  nanogent start --docker force docker mode (ignores config.json)
-  nanogent start --node   force node mode (ignores config.json)
-  nanogent uninstall      delete .nanogent/ after confirmation
-  nanogent uninstall -f   delete .nanogent/ without confirmation
+  nanogent init             drop everything into .nanogent/ (runtime, prompt, config, contacts, tool, channel, provider)
+  nanogent start            run the listener — reads .nanogent/config.json to choose node or docker mode
+  nanogent start --docker   force docker mode (ignores config.json)
+  nanogent start --node     force node mode (ignores config.json)
+  nanogent update           update runtime code; preserves prompt / config / contacts / local plugin edits
+  nanogent update --force   also overwrite locally-modified plugin files
+  nanogent update --dry-run show what update would do, without changing files
+  nanogent uninstall        delete .nanogent/ after confirmation
+  nanogent uninstall -f     delete .nanogent/ without confirmation
 
 after init:
   1. cp .nanogent/.env.example .nanogent/.env
-  2. fill TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, ANTHROPIC_API_KEY
-  3. edit .nanogent/prompt.md for this project / client
-  4. optionally flip "docker": true in .nanogent/config.json
-  5. nanogent start
+  2. fill TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY in .env
+  3. edit .nanogent/contacts.json — replace the REPLACE_WITH_YOUR_TELEGRAM_* placeholders
+  4. edit .nanogent/prompt.md for this project / client
+  5. optionally flip "docker": true in .nanogent/config.json
+  6. nanogent start
 
 in-chat (once running):
   any text    → routed through the chat agent, which may delegate to tools
   /status     current background job
   /cancel     cancel running job
-  /clear      wipe chat history
+  /clear      wipe chat history for the current chat
   /help       show command list
 
-to stop:  Ctrl+C   (or: kill <pid> / pm2 stop / docker compose down)
-to remove: nanogent uninstall   (or: rm -rf .nanogent)
+to stop:    Ctrl+C   (or: kill <pid> / pm2 stop / docker compose down)
+to update:  nanogent update
+to remove:  nanogent uninstall   (or: rm -rf .nanogent)
 `;
 
 /**
- * Manifest: template source → destination (relative to cwd).
- * Rename semantics are baked in — template filenames are flat, installed
- * filenames are scoped under .nanogent/.
+ * Manifest. Every template file maps to a destination, tagged with a type
+ * that determines how `nanogent update` handles it:
+ *
+ *   code   — always overwritten on update. No one should be customising these.
+ *   plugin — overwritten only if the file is byte-identical to what we ship
+ *            (no local modifications). Lets bug fixes reach users while
+ *            preserving any customisations operators have made.
+ *   config — never touched by update; only created if missing. Operator-owned.
  */
 const MANIFEST = [
-  { src: 'nanogent.mjs',       dest: '.nanogent/nanogent.mjs' },
-  { src: 'prompt.md',          dest: '.nanogent/prompt.md' },
-  { src: 'config.json',        dest: '.nanogent/config.json' },
-  { src: 'contacts.json',      dest: '.nanogent/contacts.json' },
-  { src: '.env.example',       dest: '.nanogent/.env.example' },
-  { src: 'gitignore',          dest: '.nanogent/.gitignore' },   // npm strips .gitignore from packages, so ship it as `gitignore` and rename on install
-  { src: 'Dockerfile',         dest: '.nanogent/Dockerfile' },
-  { src: 'docker-compose.yml', dest: '.nanogent/docker-compose.yml' },
+  // Core runtime (always updatable)
+  { src: 'nanogent.mjs',       dest: '.nanogent/nanogent.mjs',       type: 'code' },
+  { src: 'Dockerfile',         dest: '.nanogent/Dockerfile',         type: 'code' },
+  { src: 'docker-compose.yml', dest: '.nanogent/docker-compose.yml', type: 'code' },
+  { src: '.env.example',       dest: '.nanogent/.env.example',       type: 'code' },
 
-  // Default tool
-  { src: 'tools/claude/index.mjs', dest: '.nanogent/tools/claude/index.mjs' },
-  { src: 'tools/claude/README.md', dest: '.nanogent/tools/claude/README.md' },
-  { src: 'tools/claude/gitignore', dest: '.nanogent/tools/claude/.gitignore' },  // same npm-strips-.gitignore workaround
+  // User config (never touched by update; only created on init)
+  { src: 'prompt.md',          dest: '.nanogent/prompt.md',          type: 'config' },
+  { src: 'config.json',        dest: '.nanogent/config.json',        type: 'config' },
+  { src: 'contacts.json',      dest: '.nanogent/contacts.json',      type: 'config' },
+  { src: 'gitignore',          dest: '.nanogent/.gitignore',         type: 'config' },  // npm strips .gitignore — ship as `gitignore`, rename on install
+
+  // Default tool (customisable, but update if unmodified)
+  { src: 'tools/claude/index.mjs', dest: '.nanogent/tools/claude/index.mjs', type: 'plugin' },
+  { src: 'tools/claude/README.md', dest: '.nanogent/tools/claude/README.md', type: 'plugin' },
+  { src: 'tools/claude/gitignore', dest: '.nanogent/tools/claude/.gitignore', type: 'plugin' },  // same npm workaround
 
   // Default channel
-  { src: 'channels/telegram/index.mjs', dest: '.nanogent/channels/telegram/index.mjs' },
-  { src: 'channels/telegram/README.md', dest: '.nanogent/channels/telegram/README.md' },
+  { src: 'channels/telegram/index.mjs', dest: '.nanogent/channels/telegram/index.mjs', type: 'plugin' },
+  { src: 'channels/telegram/README.md', dest: '.nanogent/channels/telegram/README.md', type: 'plugin' },
 
   // Default provider
-  { src: 'providers/anthropic/index.mjs', dest: '.nanogent/providers/anthropic/index.mjs' },
-  { src: 'providers/anthropic/README.md', dest: '.nanogent/providers/anthropic/README.md' },
+  { src: 'providers/anthropic/index.mjs', dest: '.nanogent/providers/anthropic/index.mjs', type: 'plugin' },
+  { src: 'providers/anthropic/README.md', dest: '.nanogent/providers/anthropic/README.md', type: 'plugin' },
 ];
 
 function copyFromManifest(manifest) {
@@ -80,6 +93,98 @@ function copyFromManifest(manifest) {
     copyFileSync(from, to);
     console.log(`created:       ${dest}`);
   }
+}
+
+/**
+ * Iterate the manifest with type-aware update semantics.
+ *
+ *   code:   always overwrite
+ *   plugin: overwrite only if unmodified locally (byte-identical); otherwise
+ *           skip and surface a diff hint — pass --force to override
+ *   config: never overwrite; only create if missing
+ *
+ * Returns a summary object for the final report.
+ */
+function runUpdate({ force, dryRun }) {
+  const counts = { updated: 0, created: 0, preserved: 0, skipped: 0, identical: 0 };
+  const skippedPaths = [];
+
+  for (const { src, dest, type } of MANIFEST) {
+    const from = join(tplDir, src);
+    const to   = join(process.cwd(), dest);
+    const missing = !existsSync(to);
+
+    // Missing files are created regardless of type — new version introduced a
+    // new file, operator wants it.
+    if (missing) {
+      if (!dryRun) {
+        mkdirSync(dirname(to), { recursive: true });
+        copyFileSync(from, to);
+      }
+      console.log(`created:    ${dest}`);
+      counts.created++;
+      continue;
+    }
+
+    if (type === 'config') {
+      console.log(`preserved:  ${dest} (user config)`);
+      counts.preserved++;
+      continue;
+    }
+
+    if (type === 'code') {
+      if (!dryRun) copyFileSync(from, to);
+      console.log(`updated:    ${dest}`);
+      counts.updated++;
+      continue;
+    }
+
+    if (type === 'plugin') {
+      const current = readFileSync(to);
+      const shipped = readFileSync(from);
+      if (current.equals(shipped)) {
+        console.log(`unchanged:  ${dest}`);
+        counts.identical++;
+        continue;
+      }
+      if (force) {
+        if (!dryRun) copyFileSync(from, to);
+        console.log(`updated:    ${dest} (forced overwrite of local changes)`);
+        counts.updated++;
+      } else {
+        console.log(`skipped:    ${dest} (locally modified — pass --force to overwrite)`);
+        skippedPaths.push(dest);
+        counts.skipped++;
+      }
+      continue;
+    }
+
+    console.log(`? unknown type '${type}' for ${dest} (skipping)`);
+  }
+
+  console.log('');
+  console.log(
+    `Summary: ${counts.updated} updated, ${counts.created} created, ` +
+    `${counts.identical} already up-to-date, ${counts.preserved} preserved, ${counts.skipped} skipped`,
+  );
+
+  if (skippedPaths.length > 0) {
+    console.log('');
+    console.log('Skipped files had local modifications. To compare one against the shipped version:');
+    for (const p of skippedPaths) {
+      const src = MANIFEST.find(m => m.dest === p)?.src;
+      if (src) console.log(`  diff ${p} ${join(tplDir, src)}`);
+    }
+    console.log('');
+    console.log('To overwrite all locally-modified plugin files, re-run with --force.');
+  }
+
+  if (dryRun) {
+    console.log('');
+    console.log('(dry run — no files were actually changed)');
+  }
+
+  return counts;
 }
 
 /** Read .nanogent/config.json if present, return empty object otherwise. */
@@ -138,6 +243,14 @@ if (cmd === 'init') {
     spawn(process.execPath, [script], { stdio: 'inherit' })
       .on('exit', c => process.exit(c ?? 0));
   }
+} else if (cmd === 'update') {
+  if (!existsSync(join(process.cwd(), '.nanogent'))) {
+    console.error('.nanogent/ not found — run `nanogent init` first');
+    process.exit(1);
+  }
+  const force  = args.includes('--force') || args.includes('-f');
+  const dryRun = args.includes('--dry-run') || args.includes('-n');
+  runUpdate({ force, dryRun });
 } else if (cmd === 'uninstall') {
   const target = join(process.cwd(), '.nanogent');
   if (!existsSync(target)) {

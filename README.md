@@ -518,7 +518,47 @@ The default `claude` tool is the second case — it ships `.nanogent/tools/claud
 
 The chat agent itself is ~20 LOC of Anthropic API loop + a small tool dispatch table. Everything else is plumbing (Telegram, history, learnings, job registry, slash commands).
 
-## Stopping & removing
+## Updating, stopping & removing
+
+### Updating to a newer nanogent version
+
+```bash
+nanogent update              # update runtime; preserve your prompt, config, contacts, and local plugin edits
+nanogent update --force      # also overwrite locally-modified plugin files
+nanogent update --dry-run    # preview what would change, without touching files
+```
+
+`nanogent update` knows the difference between three kinds of files in `.nanogent/`:
+
+- **Core code** (`nanogent.mjs`, `Dockerfile`, `docker-compose.yml`, `.env.example`) — always overwritten. No one should be customising these.
+- **Default plugins** (`tools/claude/`, `channels/telegram/`, `providers/anthropic/`) — overwritten only if the file is byte-identical to what we ship. If you've customised a plugin file, update skips it with a message like:
+  ```
+  skipped:  .nanogent/tools/claude/index.mjs (locally modified — pass --force to overwrite)
+  ```
+  and tells you the exact `diff` command to compare your version against the shipped one. Pass `--force` if you actually want to reset a customisation.
+- **User config** (`prompt.md`, `config.json`, `contacts.json`, `.env`, `.gitignore`) — **never touched**. These are yours.
+
+New files introduced in a version bump (e.g., a new default plugin) are always created, regardless of type.
+
+**Typical upgrade flow:**
+
+```bash
+# preview first
+nanogent update --dry-run
+
+# then apply
+nanogent update
+
+# restart the listener if it was running
+# (Ctrl+C the old process, start it fresh)
+nanogent start
+```
+
+Your chat history, learnings, and job state all live in `.nanogent/state/` and are never touched by update.
+
+> **Note**: `nanogent update` handles compatible upgrades (e.g., v0.4.0 → v0.4.1). **Breaking releases** (e.g., v0.3.x → v0.4.0) still need their own manual migration steps — see the `Migrating from 0.x` sections earlier in this README.
+
+### Stopping
 
 ```bash
 # stop (node)
@@ -526,8 +566,11 @@ Ctrl+C                # or: pm2 stop nanogent / kill <pid>
 
 # stop (docker)
 cd .nanogent && docker compose down
+```
 
-# fully remove from a project
+### Fully removing from a project
+
+```bash
 nanogent uninstall                 # confirms, then deletes .nanogent/
 nanogent uninstall -f              # same, skip confirmation
 # or manually:
