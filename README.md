@@ -595,6 +595,52 @@ $EDITOR .nanogent/config.json
 nanogent start
 ```
 
+### Migrating from 0.9.0
+
+v0.10.0 **decouples core and plugin installation**. Core knows nothing about any specific plugin name; every installable plugin ships a required `plugin.json`; the default plugin set moves from a hardcoded array inside `bin/cli.ts` into `template/profiles/default.json` (data, not code); and a new `nanogent plugin add/remove/list` subcommand gives third-party plugins a first-class lifecycle. See [DESIGN.md DR-013](./DESIGN.md#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data) for the full rationale.
+
+What's new:
+
+- **`plugin.json` is required** on every installable plugin. Minimal shape:
+  ```json
+  {
+    "name": "claude",
+    "type": "tools",
+    "description": "Delegate tool calls to Claude Code CLI",
+    "files": ["index.ts", "README.md", "install.sh", "gitignore"]
+  }
+  ```
+  `type` is one of `tools`, `channels`, `providers`, `history`, `memory`, `scheduler`. `files` is optional — if omitted, the installer copies every non-hidden top-level file in the plugin dir. Declare it explicitly if your plugin ships a `gitignore` (renamed to `.gitignore` on install) or any other file that'd otherwise be hidden from the default walker.
+- **`nanogent plugin list` / `add <path>` / `remove <name>`** is the new lifecycle subcommand. `add` takes a local path to any directory with a valid `plugin.json`; remove takes a plugin `name` and prompts for confirmation unless `-f` is passed. Third-party plugins install through the exact same code path as shipped defaults.
+- **`nanogent init --profile <path>`** lets operators author their own profile files to ship an opinionated plugin set for a team. The default profile is `template/profiles/default.json` (seven plugins: the existing defaults), and a `minimal.json` ships too (zero plugins — a core-only skeleton for operators who want to author everything from scratch).
+- **Filename conventions** (the two workarounds for `npm pack`): a file literally named `gitignore` is copied as `.gitignore`, and `install.sh` is chmod'd to `0o755` after copy. These are applied automatically — you just write the file.
+- **`bin/cli.ts` no longer names any specific plugin.** Grep it for `claude`, `telegram`, `anthropic`, `jsonl`, `naive`, `schedule` — none appear. The vocabulary is generic (`PLUGIN_TYPES` and the profile file).
+
+Breaking change: existing v0.9.0 `.nanogent/` installations don't have a `plugin.json` in each plugin dir, so `nanogent plugin list` and phase-2 of `nanogent update` will log a warning and skip each plugin. Two migration options:
+
+```bash
+# Option A — clean re-init (if you haven't customised any plugin files)
+rm -rf .nanogent
+npm install -g nanogent@latest
+nanogent init
+
+# Option B — hand-author a plugin.json per plugin dir (if you have local edits worth preserving)
+npm install -g nanogent@latest
+# For each plugin dir under .nanogent/tools, channels, providers, history, memory, scheduler:
+cat > .nanogent/tools/claude/plugin.json <<'EOF'
+{ "name": "claude", "type": "tools", "files": ["index.ts", "README.md", "install.sh", "gitignore"] }
+EOF
+# ... then:
+nanogent update
+nanogent start
+```
+
+For plugins that don't ship a renamed file (everything except `tools/claude` in the default set), the `files` field can be omitted:
+
+```json
+{ "name": "telegram", "type": "channels", "description": "Telegram bot transport" }
+```
+
 Once running, a client just sends any text to the bot. The chat agent:
 
 1. Decides whether the message is addressed to it (calls `skip` if not)
@@ -617,20 +663,34 @@ Slash commands are cheap and instant (no LLM call); they operate directly on the
 
 ## Adding a tool
 
-A tool is a **folder** in `.nanogent/tools/` with one required file: `index.ts`. Everything else in the folder — helpers, assets, schemas, README, tests — is the tool's own business.
+A tool is a **folder** in `.nanogent/tools/` with two required files: `plugin.json` (metadata) and `index.ts` (the tool object). Everything else in the folder — helpers, assets, schemas, README, tests — is the tool's own business.
 
 ```
 .nanogent/tools/
   claude/
+    plugin.json      ← REQUIRED. { "name": "claude", "type": "tools", ... }
     index.ts         ← REQUIRED. Default-exports the tool object.
     README.md        ← recommended — setup notes, API keys, example invocations.
   rag/               ← example of a folder-shaped tool that outgrew one file
+    plugin.json
     index.ts
     README.md
     chunker.ts       ← helpers the tool imports via normal relative imports
     schemas/
       answer.json
 ```
+
+A minimum-viable `plugin.json`:
+
+```json
+{
+  "name": "rag",
+  "type": "tools",
+  "description": "Answer a question by searching the project's knowledge base"
+}
+```
+
+`type` decides where the plugin lives on disk (`tools`, `channels`, `providers`, `history`, `memory`, `scheduler`); `name` must match the directory name. `files` is optional — when omitted, the installer copies every non-hidden top-level file in the plugin dir. See [DESIGN.md DR-013](./DESIGN.md#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data) for the full manifest contract.
 
 Minimum viable tool — `rag/index.ts`:
 
@@ -735,6 +795,27 @@ The default `claude` tool is the second case — it ships `.nanogent/tools/claud
 
 **Nothing about core changes when you add a tool with state.** No new config, no registration, no opt-in. `ctx.toolDir` is always defined, `mkdir + write` is all the API you need, and the gitignore story is the tool's problem.
 
+## Managing plugins
+
+Same lifecycle applies to every plugin type — tools, channels, providers, history, memory, scheduler. `nanogent init` installs the plugins listed in the active profile (default: `template/profiles/default.json`), and after that `nanogent plugin` manages anything you want to add or remove:
+
+```bash
+nanogent plugin list                 # what's installed, with descriptions
+nanogent plugin add ./path/to/dir    # install a local plugin (needs a plugin.json)
+nanogent plugin add ~/my-tool --force  # overwrite an existing install
+nanogent plugin remove schedule      # prompts; -f to skip confirmation
+```
+
+`plugin add` resolves the ref, validates `plugin.json`, copies files to `.nanogent/<type>/<name>/`, applies the `gitignore → .gitignore` rename and the `install.sh` chmod, then re-runs `nanogent build` so any new `install.sh` makes it into the next image build. Third-party plugins install through exactly the same code path as the shipped defaults — no second-class citizens.
+
+**Profiles** are JSON files listing plugin refs relative to the profile file's directory:
+
+```bash
+nanogent init --profile ./team-profiles/minimal.json
+```
+
+Ship an opinionated profile alongside your project (git-tracked, reviewable, diffable) and every `nanogent init` drops the same plugin set. The two profiles bundled with the CLI — `default.json` (the seven current defaults) and `minimal.json` (zero plugins — core only) — live under `template/profiles/` in the installed package and can be used as starting points.
+
 ## How it works
 
 1. **Long-poll Telegram.** No webhook, no inbound ports.
@@ -760,14 +841,14 @@ nanogent update --dry-run    # preview what would change, without touching files
 `nanogent update` knows the difference between three kinds of files in `.nanogent/`:
 
 - **Core code** (`nanogent.ts`, `types.d.ts`, `Dockerfile`, `docker-compose.yml`, `.env.example`) — always overwritten. No one should be customising these.
-- **Default plugins** (`tools/claude/`, `channels/telegram/`, `providers/anthropic/`) — overwritten only if the file is byte-identical to what we ship. If you've customised a plugin file, update skips it with a message like:
+- **Installed plugins** — phase 2 walks every `.nanogent/<type>/<name>/` dir that ships a `plugin.json`, tries to re-resolve against the shipped source, and for each file byte-compares local vs shipped. Unmodified files get the new shipped version; locally-modified files are skipped with a message like:
   ```
   skipped:  .nanogent/tools/claude/index.ts (locally modified — pass --force to overwrite)
   ```
-  and tells you the exact `diff` command to compare your version against the shipped one. Pass `--force` if you actually want to reset a customisation.
+  and a `diff` command hint comparing your version against the shipped one. Pass `--force` if you actually want to reset a customisation. Third-party plugins installed via `nanogent plugin add` are logged as `skipped: ... (no shipped source — third-party plugin)` and left alone.
 - **User config** (`prompt.md`, `config.json`, `contacts.json`, `.env`, `.gitignore`) — **never touched**. These are yours.
 
-New files introduced in a version bump (e.g., a new default plugin) are always created, regardless of type.
+New files introduced in a version bump are always created, regardless of type.
 
 **Typical upgrade flow:**
 

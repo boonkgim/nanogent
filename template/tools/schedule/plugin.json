@@ -1,0 +1,5 @@
+{
+  "name": "schedule",
+  "type": "tools",
+  "description": "Agent-facing tool to create, list, and cancel scheduled triggers (pairs with a scheduler plugin)"
+}

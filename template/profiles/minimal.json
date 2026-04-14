@@ -1,0 +1,5 @@
+{
+  "name": "minimal",
+  "description": "Core files only. No plugins — the agent won't boot until you `nanogent plugin add` at least one channel, one provider, and one history store.",
+  "plugins": []
+}

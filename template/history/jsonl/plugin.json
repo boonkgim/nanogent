@@ -1,0 +1,5 @@
+{
+  "name": "jsonl",
+  "type": "history",
+  "description": "Append-only JSONL history store (one file per contact)"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "telegram",
+  "type": "channels",
+  "description": "Telegram bot transport via long-polling getUpdates"
+}

@@ -5,14 +5,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync,
+  mkdtempSync, mkdirSync, statSync, writeFileSync, readFileSync, rmSync, existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  aggregatePluginResources, composeDockerfile, discoverPluginInstalls,
-  discoverPluginResources, runBuild, runUpdate,
+  aggregatePluginResources, composeDockerfile, composeUpdateEntries,
+  discoverPluginInstalls, discoverPluginResources,
+  installPlugin, listInstalledPlugins, loadProfile, readPluginManifest,
+  resolvePlugin, runBuild, runUpdate,
 } from '../bin/cli.ts';
 
 interface Fixture {
@@ -527,6 +529,473 @@ describe('plugin resources advisory', () => {
       assert.ok(logs.some(l => l.includes('tools/broken/resources.json') && l.includes('not valid JSON')));
       assert.ok(!logs.some(l => l.includes('advisory:')));
     } finally { f.cleanup(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plugin system (v0.10.0) — manifest reader, resolver, installer, discovery.
+// ---------------------------------------------------------------------------
+
+describe('readPluginManifest', () => {
+  function setup(): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), 'nanogent-manifest-'));
+    return { dir, cleanup: () => { rmSync(dir, { recursive: true, force: true }); } };
+  }
+
+  it('parses a valid manifest', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({
+        name: 'claude', type: 'tools', description: 'Claude Code CLI',
+      }));
+      const m = readPluginManifest(f.dir);
+      assert.equal(m.name, 'claude');
+      assert.equal(m.type, 'tools');
+      assert.equal(m.description, 'Claude Code CLI');
+      assert.equal(m.files, undefined);
+    } finally { f.cleanup(); }
+  });
+
+  it('parses an explicit files list', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({
+        name: 'x', type: 'tools', files: ['index.ts', 'README.md', 'install.sh'],
+      }));
+      const m = readPluginManifest(f.dir);
+      assert.deepEqual(m.files, ['index.ts', 'README.md', 'install.sh']);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if plugin.json is missing', () => {
+    const f = setup();
+    try {
+      assert.throws(() => readPluginManifest(f.dir), /missing plugin\.json/);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws on invalid JSON', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'plugin.json'), '{ not json');
+      assert.throws(() => readPluginManifest(f.dir), /invalid JSON/);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if name is missing or has path separators', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({ type: 'tools' }));
+      assert.throws(() => readPluginManifest(f.dir), /'name'/);
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({ name: 'foo/bar', type: 'tools' }));
+      assert.throws(() => readPluginManifest(f.dir), /'name'/);
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({ name: '..', type: 'tools' }));
+      assert.throws(() => readPluginManifest(f.dir), /'name'/);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if type is not a valid PluginType', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({ name: 'x', type: 'widget' }));
+      assert.throws(() => readPluginManifest(f.dir), /'type'/);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if files entries have traversal attempts', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'plugin.json'), JSON.stringify({
+        name: 'x', type: 'tools', files: ['../etc/passwd'],
+      }));
+      assert.throws(() => readPluginManifest(f.dir), /'files'/);
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('resolvePlugin', () => {
+  function setup(): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), 'nanogent-resolve-'));
+    return { dir, cleanup: () => { rmSync(dir, { recursive: true, force: true }); } };
+  }
+
+  it('resolves a relative ref against baseDir and derives a default file list', () => {
+    const f = setup();
+    try {
+      const src = join(f.dir, 'tools/claude');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'plugin.json'), JSON.stringify({ name: 'claude', type: 'tools' }));
+      writeFileSync(join(src, 'index.ts'), 'export default {}');
+      writeFileSync(join(src, 'README.md'), '# claude');
+      writeFileSync(join(src, '.hidden'), 'should be skipped');
+
+      const r = resolvePlugin('./tools/claude', f.dir);
+      assert.equal(r.sourceDir, src);
+      assert.equal(r.manifest.name, 'claude');
+      // Default file list is alphabetical, hidden files excluded, includes plugin.json
+      assert.deepEqual(r.files, ['README.md', 'index.ts', 'plugin.json']);
+    } finally { f.cleanup(); }
+  });
+
+  it('uses explicit files list when manifest declares one', () => {
+    const f = setup();
+    try {
+      const src = join(f.dir, 'plug');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'plugin.json'), JSON.stringify({
+        name: 'plug', type: 'tools', files: ['index.ts', 'gitignore'],
+      }));
+      writeFileSync(join(src, 'index.ts'), 'x');
+      writeFileSync(join(src, 'gitignore'), 'node_modules\n');
+      writeFileSync(join(src, 'README.md'), 'not listed');
+
+      const r = resolvePlugin(src, '/unused');
+      assert.deepEqual(r.files, ['index.ts', 'gitignore']);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if the ref does not exist', () => {
+    const f = setup();
+    try {
+      assert.throws(() => resolvePlugin('./nope', f.dir), /does not resolve to a directory/);
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('loadProfile', () => {
+  function setup(): { dir: string; cleanup: () => void } {
+    const dir = mkdtempSync(join(tmpdir(), 'nanogent-profile-'));
+    return { dir, cleanup: () => { rmSync(dir, { recursive: true, force: true }); } };
+  }
+
+  it('parses a valid profile', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'p.json'), JSON.stringify({
+        name: 'default', description: 'd',
+        plugins: [{ ref: '../tools/claude' }, { ref: '../channels/telegram' }],
+      }));
+      const p = loadProfile(join(f.dir, 'p.json'));
+      assert.equal(p.name, 'default');
+      assert.equal(p.description, 'd');
+      assert.equal(p.plugins.length, 2);
+      assert.equal(p.plugins[0]?.ref, '../tools/claude');
+    } finally { f.cleanup(); }
+  });
+
+  it('throws on missing file', () => {
+    assert.throws(() => loadProfile('/nonexistent/profile.json'), /profile file not found/);
+  });
+
+  it('throws on invalid JSON', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'p.json'), '{ bad');
+      assert.throws(() => loadProfile(join(f.dir, 'p.json')), /invalid JSON/);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if plugins is not an array', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'p.json'), JSON.stringify({ name: 'x', plugins: 'wrong' }));
+      assert.throws(() => loadProfile(join(f.dir, 'p.json')), /'plugins'/);
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if a plugin entry has no ref', () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.dir, 'p.json'), JSON.stringify({ name: 'x', plugins: [{}] }));
+      assert.throws(() => loadProfile(join(f.dir, 'p.json')), /'ref'/);
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('installPlugin', () => {
+  interface InstallFixture { src: string; nanogent: string; cleanup: () => void; }
+  function setup(): InstallFixture {
+    const src = mkdtempSync(join(tmpdir(), 'nanogent-install-src-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'nanogent-install-cwd-'));
+    mkdirSync(join(cwd, '.nanogent'), { recursive: true });
+    return {
+      src,
+      nanogent: join(cwd, '.nanogent'),
+      cleanup: () => {
+        rmSync(src, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function seedSrc(dir: string, files: Record<string, string>): void {
+    for (const [rel, content] of Object.entries(files)) {
+      writeFileSync(join(dir, rel), content);
+    }
+  }
+
+  it('copies files and renames gitignore → .gitignore', () => {
+    const f = setup();
+    try {
+      seedSrc(f.src, {
+        'plugin.json': JSON.stringify({ name: 'claude', type: 'tools' }),
+        'index.ts': 'export default {}',
+        'README.md': '# claude',
+        'gitignore': 'node_modules\n',
+      });
+      const logs: string[] = [];
+      const r = installPlugin(resolvePlugin(f.src, '/unused'), f.nanogent, {
+        logger: (m) => { logs.push(m); },
+      });
+      assert.equal(r.targetDir, join(f.nanogent, 'tools/claude'));
+      assert.ok(existsSync(join(r.targetDir, 'index.ts')));
+      assert.ok(existsSync(join(r.targetDir, 'README.md')));
+      assert.ok(existsSync(join(r.targetDir, '.gitignore')));
+      assert.ok(!existsSync(join(r.targetDir, 'gitignore')));
+      // plugin.json always lands at the target
+      assert.ok(existsSync(join(r.targetDir, 'plugin.json')));
+      assert.ok(logs.some(l => l.includes('installed:') && l.includes('tools/claude')));
+    } finally { f.cleanup(); }
+  });
+
+  it('chmods install.sh to executable', () => {
+    const f = setup();
+    try {
+      seedSrc(f.src, {
+        'plugin.json': JSON.stringify({ name: 'claude', type: 'tools' }),
+        'install.sh': '#!/bin/bash\necho ok\n',
+      });
+      installPlugin(resolvePlugin(f.src, '/unused'), f.nanogent, { logger: () => { /* silent */ } });
+      const mode = statSync(join(f.nanogent, 'tools/claude/install.sh')).mode & 0o777;
+      assert.equal((mode & 0o100) !== 0, true, `expected user-exec bit set, got ${mode.toString(8)}`);
+    } finally { f.cleanup(); }
+  });
+
+  it('refuses to overwrite an existing plugin dir without force', () => {
+    const f = setup();
+    try {
+      seedSrc(f.src, {
+        'plugin.json': JSON.stringify({ name: 'claude', type: 'tools' }),
+        'index.ts': 'v1',
+      });
+      const resolved = resolvePlugin(f.src, '/unused');
+      installPlugin(resolved, f.nanogent, { logger: () => { /* silent */ } });
+      assert.throws(
+        () => installPlugin(resolved, f.nanogent, { logger: () => { /* silent */ } }),
+        /already installed/,
+      );
+    } finally { f.cleanup(); }
+  });
+
+  it('overwrites when force is set', () => {
+    const f = setup();
+    try {
+      seedSrc(f.src, {
+        'plugin.json': JSON.stringify({ name: 'claude', type: 'tools' }),
+        'index.ts': 'v1',
+      });
+      const resolved = resolvePlugin(f.src, '/unused');
+      installPlugin(resolved, f.nanogent, { logger: () => { /* silent */ } });
+      // Bump source and reinstall with force
+      writeFileSync(join(f.src, 'index.ts'), 'v2');
+      installPlugin(resolved, f.nanogent, { force: true, logger: () => { /* silent */ } });
+      assert.equal(
+        readFileSync(join(f.nanogent, 'tools/claude/index.ts'), 'utf8'),
+        'v2',
+      );
+    } finally { f.cleanup(); }
+  });
+
+  it('throws if a declared file is missing in source', () => {
+    const f = setup();
+    try {
+      seedSrc(f.src, {
+        'plugin.json': JSON.stringify({ name: 'x', type: 'tools', files: ['index.ts', 'ghost.ts'] }),
+        'index.ts': '',
+      });
+      assert.throws(
+        () => installPlugin(resolvePlugin(f.src, '/unused'), f.nanogent, { logger: () => { /* silent */ } }),
+        /ghost\.ts/,
+      );
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('listInstalledPlugins', () => {
+  function setup(): { nanogent: string; cleanup: () => void } {
+    const cwd = mkdtempSync(join(tmpdir(), 'nanogent-list-'));
+    const nanogent = join(cwd, '.nanogent');
+    mkdirSync(nanogent, { recursive: true });
+    return { nanogent, cleanup: () => { rmSync(cwd, { recursive: true, force: true }); } };
+  }
+
+  function write(dir: string, rel: string, content: string): void {
+    mkdirSync(join(dir, '..'), { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, rel), content);
+  }
+
+  it('returns empty when nothing is installed', () => {
+    const f = setup();
+    try {
+      assert.deepEqual(listInstalledPlugins(f.nanogent), []);
+    } finally { f.cleanup(); }
+  });
+
+  it('discovers plugins with valid plugin.json', () => {
+    const f = setup();
+    try {
+      write(join(f.nanogent, 'tools/claude'), 'plugin.json', JSON.stringify({ name: 'claude', type: 'tools' }));
+      write(join(f.nanogent, 'tools/claude'), 'index.ts', '');
+      write(join(f.nanogent, 'channels/telegram'), 'plugin.json', JSON.stringify({ name: 'telegram', type: 'channels' }));
+      write(join(f.nanogent, 'channels/telegram'), 'index.ts', '');
+
+      const out = listInstalledPlugins(f.nanogent);
+      assert.equal(out.length, 2);
+      // PLUGIN_TYPES order: tools before channels
+      assert.equal(out[0]?.type, 'tools');
+      assert.equal(out[0]?.name, 'claude');
+      assert.equal(out[1]?.type, 'channels');
+    } finally { f.cleanup(); }
+  });
+
+  it('warns and skips dirs without plugin.json', () => {
+    const f = setup();
+    try {
+      mkdirSync(join(f.nanogent, 'tools/stale'), { recursive: true });
+      writeFileSync(join(f.nanogent, 'tools/stale/index.ts'), 'v0.9.0 layout');
+      const logs: string[] = [];
+      const out = listInstalledPlugins(f.nanogent, (m) => { logs.push(m); });
+      assert.equal(out.length, 0);
+      assert.ok(logs.some(l => l.includes('tools/stale') && l.includes('no plugin.json')));
+    } finally { f.cleanup(); }
+  });
+
+  it('warns on name/type mismatch between dir and manifest', () => {
+    const f = setup();
+    try {
+      // Dir says tools/claude, manifest says channels/telegram — reject.
+      write(join(f.nanogent, 'tools/claude'), 'plugin.json', JSON.stringify({
+        name: 'telegram', type: 'channels',
+      }));
+      const logs: string[] = [];
+      const out = listInstalledPlugins(f.nanogent, (m) => { logs.push(m); });
+      assert.equal(out.length, 0);
+      assert.ok(logs.some(l => l.includes('mismatch')));
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('composeUpdateEntries', () => {
+  function setup(): { tpl: string; cwd: string; cleanup: () => void } {
+    const tpl = mkdtempSync(join(tmpdir(), 'nanogent-comp-tpl-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'nanogent-comp-cwd-'));
+    return { tpl, cwd, cleanup: () => {
+      rmSync(tpl, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    } };
+  }
+
+  it('returns just CORE_MANIFEST entries when .nanogent is missing', () => {
+    const f = setup();
+    try {
+      const logs: string[] = [];
+      const entries = composeUpdateEntries(f.tpl, f.cwd, (m) => { logs.push(m); });
+      // All entries are 'code' or 'config', none 'plugin'
+      assert.ok(entries.every(e => e.type === 'code' || e.type === 'config'));
+      assert.ok(entries.length >= 5); // at least the core runtime files
+    } finally { f.cleanup(); }
+  });
+
+  it('includes plugin entries for each installed plugin with a shipped source', () => {
+    const f = setup();
+    try {
+      // Shipped source. `files` is declared explicitly so that the installed
+      // plugin.json's (identical) copy of this manifest lists 'gitignore'
+      // (source-side name), which composeUpdateEntries then forward-renames
+      // to '.gitignore' when computing the dest.
+      const manifest = JSON.stringify({
+        name: 'claude', type: 'tools',
+        files: ['index.ts', 'gitignore'],
+      });
+      mkdirSync(join(f.tpl, 'tools/claude'), { recursive: true });
+      writeFileSync(join(f.tpl, 'tools/claude/plugin.json'), manifest);
+      writeFileSync(join(f.tpl, 'tools/claude/index.ts'), 'shipped');
+      writeFileSync(join(f.tpl, 'tools/claude/gitignore'), 'ignore');
+      // Installed plugin — identical manifest, with the gitignore already
+      // renamed on disk.
+      mkdirSync(join(f.cwd, '.nanogent/tools/claude'), { recursive: true });
+      writeFileSync(join(f.cwd, '.nanogent/tools/claude/plugin.json'), manifest);
+      writeFileSync(join(f.cwd, '.nanogent/tools/claude/index.ts'), 'installed');
+      writeFileSync(join(f.cwd, '.nanogent/tools/claude/.gitignore'), 'ignore');
+
+      const logs: string[] = [];
+      const entries = composeUpdateEntries(f.tpl, f.cwd, (m) => { logs.push(m); });
+      const pluginEntries = entries.filter(e => e.type === 'plugin');
+      // index.ts, plugin.json, .gitignore (dest after forward-rename)
+      const dests = pluginEntries.map(e => e.dest).sort();
+      assert.deepEqual(dests, [
+        '.nanogent/tools/claude/.gitignore',
+        '.nanogent/tools/claude/index.ts',
+        '.nanogent/tools/claude/plugin.json',
+      ]);
+      // Dest `.gitignore` maps back to source-side `gitignore`.
+      const giEntry = pluginEntries.find(e => e.dest.endsWith('/.gitignore'));
+      assert.equal(giEntry?.src, 'tools/claude/gitignore');
+    } finally { f.cleanup(); }
+  });
+
+  it('skips installed plugins without a shipped source and logs it', () => {
+    const f = setup();
+    try {
+      // Installed plugin, no shipped source
+      mkdirSync(join(f.cwd, '.nanogent/tools/thirdparty'), { recursive: true });
+      writeFileSync(join(f.cwd, '.nanogent/tools/thirdparty/plugin.json'), JSON.stringify({
+        name: 'thirdparty', type: 'tools',
+      }));
+      writeFileSync(join(f.cwd, '.nanogent/tools/thirdparty/index.ts'), 'x');
+
+      const logs: string[] = [];
+      const entries = composeUpdateEntries(f.tpl, f.cwd, (m) => { logs.push(m); });
+      assert.equal(entries.filter(e => e.type === 'plugin').length, 0);
+      assert.ok(logs.some(l => l.includes('tools/thirdparty') && l.includes('no shipped source')));
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('end-to-end init (via helpers)', () => {
+  // Simulates what `nanogent init` does internally: copy core files via
+  // CORE_MANIFEST, load the default profile, install each referenced plugin.
+  // Uses the real shipped template/ so this catches profile-drift bugs.
+  it('installs all default-profile plugins from the shipped template', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'nanogent-e2e-'));
+    try {
+      const nanogent = join(cwd, '.nanogent');
+      mkdirSync(nanogent, { recursive: true });
+      const tplDir = join(process.cwd(), 'template');
+      const profile = loadProfile(join(tplDir, 'profiles/default.json'));
+      assert.ok(profile.plugins.length >= 1, 'default profile should list at least one plugin');
+      for (const { ref } of profile.plugins) {
+        const resolved = resolvePlugin(ref, join(tplDir, 'profiles'));
+        installPlugin(resolved, nanogent, { logger: () => { /* silent */ } });
+      }
+      const installed = listInstalledPlugins(nanogent);
+      assert.equal(installed.length, profile.plugins.length);
+      // Every installed plugin must have a plugin.json at its root
+      for (const p of installed) {
+        assert.ok(existsSync(join(p.dir, 'plugin.json')));
+      }
+      // tools/claude specifically gets its install.sh with the exec bit + .gitignore rename
+      const claude = installed.find(p => p.type === 'tools' && p.name === 'claude');
+      assert.ok(claude, 'tools/claude must be in default profile');
+      assert.ok(existsSync(join(claude!.dir, 'install.sh')));
+      assert.ok(existsSync(join(claude!.dir, '.gitignore')));
+      assert.ok(!existsSync(join(claude!.dir, 'gitignore')));
+      const mode = statSync(join(claude!.dir, 'install.sh')).mode & 0o100;
+      assert.notEqual(mode, 0, 'install.sh must be executable');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 

@@ -1,0 +1,5 @@
+{
+  "name": "anthropic",
+  "type": "providers",
+  "description": "Anthropic Messages API provider (Claude models)"
+}

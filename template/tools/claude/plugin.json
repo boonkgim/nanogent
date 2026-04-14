@@ -1,0 +1,6 @@
+{
+  "name": "claude",
+  "type": "tools",
+  "description": "Delegate tool calls to Claude Code CLI for code intelligence",
+  "files": ["index.ts", "README.md", "install.sh", "gitignore"]
+}

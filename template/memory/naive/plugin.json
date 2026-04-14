@@ -1,0 +1,5 @@
+{
+  "name": "naive",
+  "type": "memory",
+  "description": "Sliding-window retriever over the history store (last N turns)"
+}

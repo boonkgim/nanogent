@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "description": "Opinionated starter set: Telegram + Anthropic + JSONL history/scheduler + naive memory + Claude tool + schedule tool",
+  "plugins": [
+    { "ref": "../tools/claude" },
+    { "ref": "../tools/schedule" },
+    { "ref": "../channels/telegram" },
+    { "ref": "../providers/anthropic" },
+    { "ref": "../history/jsonl" },
+    { "ref": "../memory/naive" },
+    { "ref": "../scheduler/jsonl" }
+  ]
+}
