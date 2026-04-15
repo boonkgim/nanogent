@@ -85,7 +85,7 @@ Node's built-in type stripping (stable since Node 22.6, on by default since 24) 
 The whole install lives under `.nanogent/`. Nothing nanogent-related lives outside it — no symlinks, no system-wide state, no registry entries, no global npm package. Install is dropping a directory; uninstall is deleting one. Moving a project between machines is `cp -r .nanogent/`. If you're tempted to write state under `~/`, under `/etc/`, or in the user's project root, don't — put it in `.nanogent/`.
 
 **Open/closed core, pluggable tools.**
-The core runtime never changes to add capability. New tools are drop-in folders in `.nanogent/tools/<name>/` with a required `index.mjs` that default-exports `{ name, description, input_schema, execute }`. The core scans the tools directory at startup; it has no hardcoded knowledge of `claude`, `opencode`, `rag`, or any other specific tool. If you find yourself editing `nanogent.mjs` to support a new capability, stop — the capability is a tool, not a core change. And if the capability already exists as a well-maintained external tool (a coding agent, a search API, a scheduler), **wrap it rather than reimplement it** — the Claude Code team writes a better coding harness than we can, and the `claude` tool lets them.
+The core runtime never changes to add capability. New tools are drop-in folders in `.nanogent/tools/<name>/` with a required `index.ts` that default-exports `{ name, description, input_schema, execute }`. The core scans the tools directory at startup; it has no hardcoded knowledge of `claude`, `opencode`, `rag`, or any other specific tool. If you find yourself editing `nanogent.ts` to support a new capability, stop — the capability is a tool, not a core change. And if the capability already exists as a well-maintained external tool (a coding agent, a search API, a scheduler), **wrap it rather than reimplement it** — the Claude Code team writes a better coding harness than we can, and the `claude` tool lets them.
 
 **Tools are code, not skills.**
 A tool's `execute` function is deterministic JavaScript with an exact `input_schema`, run directly by the runtime — not a natural-language description the LLM interprets at runtime. Capabilities with a correct answer (running a CLI, reading a file, hitting an API with a known schema) belong in code, where they're predictable, cheap to audit, and free of LLM inference. The LLM only decides *which tool to call and how to phrase the result* — that's where probabilistic behaviour is actually the feature. Everywhere else, it's a tax on both tokens and reliability.
@@ -146,6 +146,10 @@ your-project/
         index.ts
         install.sh            ← container-side deps (installs the `claude` CLI); picked up by `nanogent build`
         README.md
+      schedule/               ← default schedule tool (reactive CRUD + proactive tick loop, self-contained)
+        index.ts
+        README.md
+        state/                ← plugin-owned runtime data: schedules.json + log.jsonl (gitignored)
     channels/
       telegram/               ← default channel plugin
         index.ts
@@ -159,11 +163,6 @@ your-project/
         index.ts
         README.md
         state/                ← plugin-owned runtime data (gitignored)
-    tools/
-      schedule/               ← default schedule tool (reactive CRUD + proactive tick loop, self-contained)
-        index.ts
-        README.md
-        state/                ← plugin-owned runtime data: schedules.json + log.jsonl (gitignored)
 ```
 
 **Your project root is untouched** — nothing nanogent-related lives outside `.nanogent/`. Teams commit `.nanogent/` as a unit to share prompt, tools, and config; runtime state stays local.
@@ -256,7 +255,7 @@ This is the **one file that controls who can reach the bot and what they can do.
 
 For deep design rationale — why these specific tradeoffs, how to handle email with multiple recipients, how to write new channel/provider plugins, etc. — see [DESIGN.md](DESIGN.md).
 
-Env vars (`NANOGENT_CHAT_MODEL`, `NANOGENT_MAX_HISTORY`, `NANOGENT_MAX_TOKENS`) still work as one-off overrides without editing the committed config file.
+Env vars (`NANOGENT_CHAT_MODEL`, `NANOGENT_HISTORY_WINDOW`, `NANOGENT_MAX_TOKENS`) still work as one-off overrides without editing the committed config file.
 
 **Already have secrets in a root `.env`?** Nanogent never reads the project's root `.env` — it only looks at `.nanogent/.env`. Three options to avoid duplication:
 
@@ -439,17 +438,17 @@ nanogent plugin remove schedule      # prompts; -f to skip confirmation
 nanogent init --profile ./team-profiles/minimal.json
 ```
 
-Ship an opinionated profile alongside your project (git-tracked, reviewable, diffable) and every `nanogent init` drops the same plugin set. The two profiles bundled with the CLI — `default.json` (the seven current defaults) and `minimal.json` (zero plugins — core only) — live under `template/profiles/` in the installed package and can be used as starting points.
+Ship an opinionated profile alongside your project (git-tracked, reviewable, diffable) and every `nanogent init` drops the same plugin set. The two profiles bundled with the CLI — `default.json` (the five current defaults: `tools/claude`, `tools/schedule`, `channels/telegram`, `providers/anthropic`, `history/jsonl`) and `minimal.json` (zero plugins — core only) — live under `template/profiles/` in the installed package and can be used as starting points.
 
 ## How it works
 
 1. **Long-poll Telegram.** No webhook, no inbound ports.
 2. **Slash commands** (`/status`, `/cancel`, `/clear`) run directly against the runtime's state — no LLM call.
 3. **Normal messages** get enqueued as "turn triggers". A worker processes triggers one at a time per project (so conversation stays coherent), running a **chat-agent turn** against the Anthropic API.
-4. **Each turn** builds the system prompt from `.nanogent-prompt.md` + learnings + current job state, passes the full history + the union of core tools + plugin tool schemas, and runs the tool-use loop until the model returns `stop_reason: end_turn`.
+4. **Each turn** builds the system prompt from `.nanogent/prompt.md` + learnings + current job state, passes the full history + the union of core tools + plugin tool schemas, and runs the tool-use loop until the model returns `stop_reason: end_turn`.
 5. **Tool calls** during a turn are dispatched to the right tool's `execute`. Sync tools return inline. Async tools register a background job and return immediately — the turn ends quickly with a "working on it" message.
 6. **Background jobs** resolve on their own timeline. On completion, the runtime enqueues a synthetic `[SYSTEM]` trigger (`Tool 'claude' (job abc, "make header darker") completed after 47s: ...`), and the worker runs a fresh chat-agent turn on it. The model sees the result and decides what to say to the client — usually sends a completion message, which Telegram pushes as a notification.
-7. **Chat history** persists to `.nanogent/state/history.jsonl`, loaded on startup. Learnings persist to `.nanogent/state/learnings.md`. Both survive restarts, redeployments, and container rebuilds.
+7. **Chat history** persists to the active history plugin's own state dir (default: `.nanogent/history/jsonl/state/<contactId>.jsonl`), loaded on demand per contact. Learnings persist to `.nanogent/state/learnings.md`. Both survive restarts, redeployments, and container rebuilds.
 
 The chat agent itself is ~20 LOC of Anthropic API loop + a small tool dispatch table. Everything else is plumbing (Telegram, history, learnings, job registry, slash commands).
 
@@ -529,10 +528,10 @@ Yes, but Claude Code is the *coding* agent — it's expensive, slow, and designe
 Yes. Delete `.nanogent/tools/claude/` and nanogent becomes a pure chat bot with whatever other tools you have (or none at all — `skip` + `learn` + `check_job_status` + `cancel_job` still work for small-talk-only setups).
 
 **Can I have multiple coding tools at once (e.g. `claude` + `opencode`)?**
-Yes. Both tool files live side-by-side in `.nanogent/tools/`. Tell the chat agent in `.nanogent-prompt.md` which tool to prefer for which kinds of tasks (e.g. *"use `claude` for TypeScript, `opencode` for Python data work"*). Tools don't know about each other; the chat agent routes.
+Yes. Both tool folders live side-by-side in `.nanogent/tools/`. Tell the chat agent in `.nanogent/prompt.md` which tool to prefer for which kinds of tasks (e.g. *"use `claude` for TypeScript, `opencode` for Python data work"*). Tools don't know about each other; the chat agent routes.
 
 **Does the chat agent remember things across restarts?**
-Yes. Chat history persists to `.nanogent/state/history.jsonl`, and learnings persist to `.nanogent/state/learnings.md`. If the process (or container) restarts, the conversation continues where it left off.
+Yes. Chat history persists via the active history plugin (default: `.nanogent/history/jsonl/state/<contactId>.jsonl`), and learnings persist to `.nanogent/state/learnings.md`. If the process (or container) restarts, the conversation continues where it left off.
 
 **What if my message lands while a background job is running?**
 The chat agent handles it. It can answer directly, call `check_job_status`, call `cancel_job` to switch directions, or refuse to start a second job of the same kind. The runtime only enforces one background job at a time — how to handle a busy state is the chat agent's decision.

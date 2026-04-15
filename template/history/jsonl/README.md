@@ -1,17 +1,20 @@
 # history/jsonl
 
 Default history store for nanogent. Append-only JSONL files, one per
-`contactId`, under `.nanogent/state/history/`.
+`contactId`, under this plugin's own state dir
+(`.nanogent/history/jsonl/state/`). Per DR-014, plugins own their state
+location — the core never reaches in.
 
 This plugin is intentionally **dumb**. It does not rotate, summarise, or
-filter — it's the raw log of everything that was said. Windowing, relevance
-ranking, and retrieval are the **memory plugin's** job (see
-`.nanogent/memory/`).
+filter — it's the raw log of everything that was said. Boundary-aware
+windowing is a core invariant (`NANOGENT_HISTORY_WINDOW`, default 80);
+per-turn retrieval/summarisation/RAG is a tool concern via the
+`contributeContext` hook (see DR-016).
 
 ## File layout
 
 ```
-.nanogent/state/history/
+.nanogent/history/jsonl/state/
   alice_dm.jsonl
   project_group.jsonl
   public_helpdesk__stranger_at_x_com.jsonl   (per-user mode; "/" sanitized to "__")
@@ -24,8 +27,9 @@ Each line is one `HistoryMessage` JSON object:
 {"role":"assistant","content":[{"type":"text","text":"hey!"}]}
 ```
 
-The format matches v0.4.x on disk — upgrading to v0.5.0 keeps existing files
-readable with no migration step.
+The on-disk line format is unchanged since v0.4.x, but v0.11.0 moved the
+files from `.nanogent/state/history/` into this plugin's own
+`.nanogent/history/jsonl/state/` directory (see README.md migration notes).
 
 ## Contract
 
@@ -48,12 +52,11 @@ core loads whatever is present — exactly one history store must be active.
 
 ## State & gitignore
 
-The state directory (`.nanogent/state/history/`) is gitignored by the
-`.nanogent/.gitignore` file the CLI drops on `init`.
+The state directory (`.nanogent/history/jsonl/state/`) is hidden by this
+plugin's own `.gitignore` (shipped as `gitignore` in source and renamed on
+install), per DR-014 — plugins own their own gitignore story.
 
 ## See also
 
-- [DESIGN.md DR-009a](../../../DESIGN.md) — why history storage is separated
-  from memory.
-- [../../memory/naive/README.md](../../memory/naive/README.md) — the default
-  memory plugin that sits on top of this store.
+- [DESIGN.md DR-014](../../../DESIGN.md#dr-014-minimal-coupling-between-core-and-plugins) — minimal core↔plugin coupling; plugins own their own state location.
+- [DESIGN.md DR-016](../../../DESIGN.md#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) — why there is no memory plugin type; tools contribute per-turn context via a hook.
