@@ -6,29 +6,20 @@ Requires **Node 24+** — the runtime ships as hand-written TypeScript and relie
 
 By default, nanogent ships with one tool: **`claude`**, which delegates coding tasks to [Claude Code](https://docs.claude.com/claude-code). You can add more tools (`rag`, `search`, `opencode`, etc.) by dropping a folder into `.nanogent/tools/` — the core runtime never needs to change.
 
-```mermaid
-flowchart LR
-    TG[Telegram]
-
-    subgraph project["lives inside your project"]
-        direction TB
-        core["<b>nanogent.ts</b> (chat agent)<br/>loop: poll → turn → tool dispatch"]
-        skip([skip<br/><i>core</i>])
-        learn([learn<br/><i>core</i>])
-        check([check_job<br/><i>core</i>])
-        core --> skip
-        core --> learn
-        core --> check
-    end
-
-    claude["<b>claude</b><br/>(one tool, not core)"]
-    rag["rag.ts<br/>(future)"]
-    codex["codex.ts<br/>(future)"]
-
-    TG <--> core
-    core -- async --> claude
-    core -- async --> rag
-    core -- async --> codex
+```
+┌─────────┐     ┌────────────────────────────────────────┐      ┌─────────────┐
+│         │     │  nanogent.ts (chat agent)              │      │   claude    │
+│Telegram │◀───▶│  ┌──────────────────────────────────┐  │─────▶│  (one tool, │
+│         │     │  │ loop: poll → turn → tool dispatch│  │ async│  not core)  │
+└─────────┘     │  └──────────────────────────────────┘  │      └─────────────┘
+                │         │          │          │        │      ┌─────────────┐
+                │         ▼          ▼          ▼        │─────▶│   rag.ts    │
+                │       skip       learn    check_job    │      │  (future)   │
+                │      (core)      (core)    (core)      │      └─────────────┘
+                └────────────────────────────────────────┘      ┌─────────────┐
+                         lives inside your project              │  codex.ts   │
+                                                                │   (future)  │
+                                                                └─────────────┘
 ```
 
 ## Two layers, one file per tool
