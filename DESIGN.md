@@ -19,6 +19,7 @@ Versions referenced:
 - **v0.8.0** — Container dependencies made pluggable. The core `Dockerfile` becomes a base stub with a marker line; each plugin can ship an optional `install.sh` next to its `index.ts`, and a new `nanogent build` CLI command composes the real `Dockerfile.generated` by splicing every plugin's install step into the base. The `@anthropic-ai/claude-code` install moves out of core and into `tools/claude/install.sh` — swapping in a different coding harness (e.g. `tools/opencode/`) no longer requires editing the core Dockerfile. See [DR-011](#dr-011-plugins-inject-container-dependencies-via-installsh).
 - **v0.9.0** — Docker becomes the only supported runtime. The host-node path, the `--node` / `--docker` start flags, and the `docker` field in `config.json` are removed. Rationale: plugin `install.sh` scripts can run `apt-get`, `npm install -g`, and write to system paths, so running them on the host is exactly the pollution Docker was added to prevent. Making Docker mandatory eliminates a dual-install contract (host vs container) and collapses the test matrix to one runtime. See [DR-012](#dr-012-docker-is-the-only-supported-runtime).
 - **v0.11.0** — Core↔plugin coupling tightened: the typed `SchedulerPlugin` seam is removed, the scheduler collapses into a self-contained `tools/schedule` that owns CRUD, tick loop, and state under its own plugin directory. `ToolPlugin` gains an optional lifecycle hook (`start(ctx)` returning an optional stop fn); `ToolStartCtx` hands the plugin `pluginDir` + a `fireSystemTurn` primitive. `HistoryStoreCtx` and `MemoryCtx` drop their `stateDir` field — plugins now write state under `pluginDir/state/`, matching the convention `tools/claude` already used. Two new principles land: [DR-014](#dr-014-minimal-core-plugin-coupling) (core provides primitives, plugins own implementation details) and [DR-015](#dr-015-portable-state-via-per-type-data-contracts) (each plugin type defines a canonical `Portable<T>` envelope so alternative backends can migrate data between themselves). DR-010 is rewritten as a reversal of the v0.7.0 scheduler-plugin design.
+- **v0.12.0** — The memory plugin type is deleted. Core always owns boundary-aware history windowing as a correctness invariant (`rotateHistory` / `isTurnStart` move back into `nanogent.ts`). Any tool can contribute extra system-prompt text per turn via a new optional `ToolPlugin.contributeContext(ctx)` hook — RAG retrievers, summary memory, clock, location, and any other reactive context source now live as ordinary tool plugins alongside the existing `start()` lifecycle. Three more optional hooks on `ToolPlugin` (`onHistoryAppended`, `onHistoryRetracted`, `onClear`) let context-contributing tools keep derived indexes in sync with the append log. `ToolStartCtx` gains a `history: HistoryStorePlugin` handle so stateful tools can backfill/reindex on boot. Plugin-type count drops from five to four (`tools`, `channels`, `providers`, `history`). DR-009b is reversed; the new shape ships as [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook).
 
 ## Architecture at a glance
 
@@ -37,31 +38,30 @@ Versions referenced:
   channels/<name>/    — plugin channels (many active)                 [v0.4.0]
   providers/<name>/   — plugin AI providers (exactly one active)      [v0.4.0]
   history/<name>/     — plugin history store  (exactly one active)    [v0.5.0]
-  memory/<name>/      — plugin memory system  (exactly one active)    [v0.5.0]
 ```
 
 Proactive behavior (scheduled triggers, webhooks, watchers) is no longer a separate plugin type — it lives inside whichever tool plugin wants it, via the optional `ToolPlugin.start(ctx)` lifecycle hook (v0.11.0, see [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook) and [DR-014](#dr-014-minimal-coreplugin-coupling)). The bundled `tools/schedule` is the reference implementation.
 
+**Reactive context injection** (RAG retrieval, summary memory, clock, location, status pollers) is also no longer a separate plugin type — v0.12.0 deletes the `memory` extensibility point. Core always windows raw history via boundary-aware rotation; any tool can push extra system-prompt text into the next turn via the optional `ToolPlugin.contributeContext(ctx)` hook. See [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook).
+
 Each installed plugin directory contains a required `plugin.json` (name, type, optional description and file list) — see [DR-013](#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data). Core installation (`nanogent init`) and plugin installation (`nanogent plugin add`) go through the same resolver + installer pipeline; shipped defaults live in `template/profiles/default.json` as data, not as a hardcoded list in `bin/cli.ts`.
 
-Five plugin directories, five extensibility points:
+Four plugin directories, four extensibility points:
 
 | Plugin type | Directory | How many active? | What it does | Status |
 |---|---|---|---|---|
-| **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent. Optional `start()` lifecycle hook lets a tool own background loops (the bundled `schedule` tool uses this for proactive triggers). | Implemented (v0.3.1; lifecycle v0.11.0) |
+| **Tool** | `tools/<name>/` | Many | Exposes a capability to the chat agent. Optional `start()` hook lets a tool own background loops (see `tools/schedule`); optional `contributeContext()` / `onHistoryAppended()` / `onHistoryRetracted()` / `onClear()` hooks let a tool inject system-prompt text and maintain derived indexes (see DR-016 — this is where RAG / summary / clock tools live). | Implemented (v0.3.1; lifecycle v0.11.0; context hooks v0.12.0) |
 | **Channel** | `channels/<name>/` | Many | Handles a transport (`telegram`, `whatsapp`, `email`, ...) | Implemented (v0.4.0) |
 | **Provider** | `providers/<name>/` | Exactly one | Implements the AI chat loop (`anthropic`, `openai`, ...) | Implemented (v0.4.0) |
 | **History store** | `history/<name>/` | Exactly one | Raw append-only message log (`jsonl`, `postgres`, ...) | Implemented (v0.5.0) |
-| **Memory** | `memory/<name>/` | Exactly one | Indexer + retriever over history (`naive`, `vector-rag`, `graphrag`, ...) | Implemented (v0.5.0) |
 
 The asymmetry in "how many active" reflects real differences:
 - **Tools are capabilities** — a project can have several (coding, RAG, search, calendar, schedule)
 - **Channels are ingress points** — a project can have several (DM via Telegram, email, group on WhatsApp)
 - **Providers are thinking layers** — a chat agent has one reasoning model per turn; multiplexing two providers within one conversation is confused, not a feature
 - **History is the source of truth** — one canonical log per install; multiple stores would split the truth
-- **Memory is a single lens** — the agent reasons from one context model at a time; two memories would disagree on what's relevant
 
-Proactive behavior (scheduled triggers, watchers, pollers) was a separate plugin type in v0.7.0 – v0.10.0 (`scheduler/<name>/`). v0.11.0 collapses it into the tool extensibility point via a lifecycle hook (`ToolPlugin.start`) — see [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook). The asymmetry "how many active" no longer needs a dedicated row: tools that need proactivity own their own loop, and tools that don't stay stateless.
+Proactive behavior (scheduled triggers, watchers, pollers) was a separate plugin type in v0.7.0 – v0.10.0 (`scheduler/<name>/`). v0.11.0 collapses it into the tool extensibility point via a lifecycle hook (`ToolPlugin.start`) — see [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook). Reactive context injection (retrieval / summary / clock) was a separate plugin type in v0.5.0 – v0.11.0 (`memory/<name>/`). v0.12.0 collapses it into the tool extensibility point via `contributeContext()` — see [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook). The asymmetry "how many active" no longer needs dedicated rows for these: tools that need the capability own it, and tools that don't stay stateless.
 
 ## Core data model (v0.4.0)
 
@@ -443,7 +443,9 @@ Bundling them would force every memory plugin to also solve storage (rewrite JSO
 
 ### DR-009b: Memory is a separate pluggable indexer/retriever over history
 
-**What.** A **memory plugin** under `.nanogent/memory/<name>/` is the system that decides what context to surface for the next turn. Exactly one memory plugin is active per install. The memory plugin receives `onAppend` notifications for every new message and returns a `RecallResult` at turn start:
+**Status:** v0.12.0 reverses the v0.5.0 design. The "memory is its own plugin type" shape (DR-009b, revision 0.2) shipped in v0.5.0 – v0.11.0. v0.12.0 deletes the `memory/<name>/` extensibility point entirely: core owns boundary-aware history windowing as a correctness invariant, and any tool that wants to push extra system-prompt text into the next turn implements the optional `ToolPlugin.contributeContext(ctx)` hook. This entry documents the original v0.5.0 decision and its reversal; the forward-looking shape lives in [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook).
+
+**What (v0.5.0 – v0.11.0, reversed).** A **memory plugin** under `.nanogent/memory/<name>/` was the system that decided what context to surface for the next turn. Exactly one memory plugin was active per install. The memory plugin received `onAppend` notifications for every new message and returned a `RecallResult` at turn start:
 
 ```ts
 interface MemoryPlugin {
@@ -602,24 +604,14 @@ Read [DR-009a](#dr-009a-history-storage-is-a-separate-pluggable-raw-log-concern)
 - [ ] `read(contactId, { limit })` should honour the `limit` hint by returning at most that many of the **most recent** messages (tail, not head)
 - [ ] `retractLast(contactId, count)` must be exact — the core tracks how many messages it committed in a turn and expects to undo them precisely
 - [ ] Treat `contactId` as opaque — the core computes it and owns the privacy semantics
-- [ ] Never rotate, summarise, or filter. Windowing is the memory plugin's job.
+- [ ] Never rotate, summarise, or filter. Boundary-aware windowing is core's job (see `rotateHistory` / `isTurnStart` in `nanogent.ts`, owned there as a correctness invariant per DR-016).
 - [ ] Keep plugin-local state (locks, indices, etc.) under `<plugin-dir>/state/` and ship a `.gitignore`
 
-### Writing a memory plugin (v0.5.0+)
+### Writing a context-contributing tool plugin (v0.12.0+)
 
-Read [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history) first.
+Read [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) first. RAG retrievers, summary memory, clock/location/status tools, and anything else that wants to push extra system-prompt text into the next turn all share the same shape: an ordinary `ToolPlugin` that implements the optional `contributeContext(ctx)` hook, plus optional `onHistoryAppended` / `onHistoryRetracted` / `onClear` hooks if it maintains a derived index.
 
-**Checklist:**
-
-- [ ] Implement the full `MemoryPlugin` contract: `init`, `recall`, `onAppend`, `onRetract`, `onClear`
-- [ ] Use `ctx.history` for bootstrap/reindex — never maintain a shadow copy of raw messages
-- [ ] `recall` returns `{ messages, systemContext? }` — keep `messages` in valid Anthropic shape (no orphan `tool_result` at head)
-- [ ] If you inject dynamic text via `systemContext`, structure it as `stable prefix + volatile suffix` to preserve prompt caching
-- [ ] `onAppend` runs on every committed message (including assistant turns, tool_use, tool_result, `[SYSTEM]` notes) — filter the ones you care about
-- [ ] `onRetract` must be reversible with `onAppend` — if you embedded messages, remove their embeddings
-- [ ] `onClear` should wipe per-contact state; long-term stores that persist across `/clear` should document that deviation
-- [ ] Log errors but don't throw — the core treats memory failures as recoverable (index can always be rebuilt from history)
-- [ ] Keep plugin-local state under `<plugin-dir>/state/` and namespace by `contactId`
+See DR-016's "Checklist for plugin authors writing a context-contributing tool" for the operational rules. Short version: return system-prompt text only (never touch the messages array), self-scope by `ctx.contactId`, budget your tokens, keep state under `ctx.pluginDir + '/state/'`, and reindex from `ctx.history` inside `start(ctx)` if your index is empty on boot.
 
 ### Writing a proactive tool plugin (v0.11.0+)
 
@@ -627,9 +619,9 @@ Read [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecy
 
 See DR-010's "Checklist for writing a proactive tool plugin" for the operational rules. Short version: implement `ToolPlugin.start(ctx)`, keep state under `ctx.pluginDir + '/state/'`, use `ctx.fireSystemTurn` to inject non-user turns, return a stop fn from `start()` for clean shutdown.
 
-### Updating plugin state location for history and memory (v0.11.0 migration)
+### Updating plugin state location for history (v0.11.0 migration)
 
-If you're writing a history store or memory plugin, note that `HistoryStoreCtx` and `MemoryCtx` no longer expose a `stateDir` field. v0.11.0 aligned these two plugin types with the DR-014 principle: plugins own their state location, so state goes under `ctx.pluginDir + '/state/'`, same as tools. Add a `gitignore` file to your plugin (listed in `plugin.json.files`) that lists `state/`.
+If you're writing a history store plugin, note that `HistoryStoreCtx` no longer exposes a `stateDir` field. v0.11.0 aligned this plugin type with the DR-014 principle: plugins own their state location, so state goes under `ctx.pluginDir + '/state/'`, same as tools. Add a `gitignore` file to your plugin (listed in `plugin.json.files`) that lists `state/`. (Memory plugins are no longer a separate type as of v0.12.0 — see [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) — so this migration note no longer applies to them.)
 
 ### DR-011: Plugins inject container dependencies via `install.sh`
 
@@ -639,15 +631,15 @@ If you're writing a history store or memory plugin, note that `HistoryStoreCtx` 
 
 The tool plugin system already solves this for *runtime* dependencies: swap out a plugin folder and the runtime picks up the replacement. But the Dockerfile lives a layer below the runtime, and the runtime has no influence over what the image contains. Anything a plugin needs *installed in the image* was a core concern by default, and that coupled every container-using install to whatever happened to be the v0.7.0 default tool set.
 
-This problem generalises beyond `tools/claude`. Different coding harnesses need different CLIs (`claude`, `opencode`, `aider`, `cursor-agent`). A `rag/pgvector` memory plugin needs `postgresql-client`. A `channels/whatsapp` plugin might need `libwebp`. A `providers/local-llm` plugin wants `ollama`. None of these should require touching core.
+This problem generalises beyond `tools/claude`. Different coding harnesses need different CLIs (`claude`, `opencode`, `aider`, `cursor-agent`). A hypothetical `tools/rag-pgvector` retriever tool needs `postgresql-client`. A `channels/whatsapp` plugin might need `libwebp`. A `providers/local-llm` plugin wants `ollama`. None of these should require touching core.
 
-**Decision:** Make container dependencies pluggable via a new file-level convention: any plugin folder may optionally ship an `install.sh` next to its `index.ts`. A new `nanogent build` CLI command walks every plugin folder under `.nanogent/{tools,channels,providers,history,memory,scheduler}/`, finds each `install.sh`, and splices matching `COPY` + `RUN` directives into a base Dockerfile marker, producing `.nanogent/Dockerfile.generated`. `docker-compose.yml` builds from the generated file, not the base. `nanogent init` auto-runs the build; `nanogent start` re-runs it if the generated file is missing.
+**Decision:** Make container dependencies pluggable via a new file-level convention: any plugin folder may optionally ship an `install.sh` next to its `index.ts`. A new `nanogent build` CLI command walks every plugin folder under `.nanogent/{tools,channels,providers,history}/` (the v0.8.0 walk also covered `memory/` and `scheduler/`; those plugin types were collapsed into the tool extensibility point in v0.11.0 and v0.12.0 respectively), finds each `install.sh`, and splices matching `COPY` + `RUN` directives into a base Dockerfile marker, producing `.nanogent/Dockerfile.generated`. `docker-compose.yml` builds from the generated file, not the base. `nanogent init` auto-runs the build; `nanogent start` re-runs it if the generated file is missing.
 
 **What:**
 
 - `template/Dockerfile` is reduced to: `FROM node:24-slim`, a minimal apt baseline (`git`, `ca-certificates`), the `# __NANOGENT_PLUGIN_INSTALLS__` marker, `WORKDIR`, and `CMD`. No plugin-specific installs.
 - `template/tools/claude/install.sh` owns `npm install -g @anthropic-ai/claude-code`. This is the only file in the repo that knows about the claude CLI dependency.
-- `nanogent build` reads the base Dockerfile, scans plugin folders in `PLUGIN_ROOTS` declaration order (`tools`, `channels`, `providers`, `history`, `memory`, `scheduler`) with alphabetical plugin-name sort within each root, and writes `.nanogent/Dockerfile.generated`. Stable ordering protects Docker's layer cache.
+- `nanogent build` reads the base Dockerfile, scans plugin folders in `PLUGIN_ROOTS` declaration order (`tools`, `channels`, `providers`, `history` — `memory` and `scheduler` were removed in v0.12.0 and v0.11.0 respectively, leaving four roots) with alphabetical plugin-name sort within each root, and writes `.nanogent/Dockerfile.generated`. Stable ordering protects Docker's layer cache.
 - Each found `install.sh` emits one block: a comment, a `COPY <rel>/install.sh /tmp/nanogent-install/<rel>/install.sh`, and a `RUN bash /tmp/nanogent-install/<rel>/install.sh`. Docker's build context is already `.nanogent/` (because compose lives inside it with `context: .`), so plugin paths resolve directly.
 - `.nanogent/Dockerfile.generated` is gitignored as a build artifact, analogous to `package-lock.json` for Docker. The base `Dockerfile` is committed; the generated file is not.
 - `nanogent init` runs build at the end of init so fresh installs are immediately docker-ready. `nanogent start` runs build if the generated file is missing so one-shot starts on fresh checkouts "just work".
@@ -667,7 +659,7 @@ This problem generalises beyond `tools/claude`. Different coding harnesses need 
 - **Plugin install.sh runs as root during `docker compose build`.** This is a meaningful trust surface — installing an untrusted plugin means running its `install.sh` as root inside your build context. Plugin authors should keep install scripts minimal and auditable. Operators should treat third-party plugin installs with the same caution they'd apply to any `curl | bash` — because that's what it is.
 - **A new manual step exists: `nanogent build` after adding/removing/editing plugin `install.sh` files.** `nanogent start` only auto-runs build when the generated file is *missing*, not when it's stale. Running build manually after plugin changes is the contract; stale-detection (hashing plugin contents) would add complexity for marginal benefit.
 - **Trust asymmetry with pure runtime plugins.** Before v0.8.0, a tool plugin could only execute code inside `runTurn` (sandboxed by the tool invocation lifecycle and the permission model). A plugin with an `install.sh` executes code during image build *before* any permission check. Nothing in core mitigates this — it's inherent to the "let plugins modify the image" goal.
-- **Build output is not a new plugin type.** It's a convention applied to existing plugin types. Every plugin can opt in via `install.sh`; none have to. (As of v0.11.0 the plugin-type extensibility points are five — tool, channel, provider, history, memory — after the scheduler type was collapsed into the tool lifecycle seam. See [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook).)
+- **Build output is not a new plugin type.** It's a convention applied to existing plugin types. Every plugin can opt in via `install.sh`; none have to. (As of v0.12.0 the plugin-type extensibility points are four — tool, channel, provider, history — after the scheduler type was collapsed into the tool lifecycle seam in v0.11.0 and the memory type was collapsed into the tool context-hook seam in v0.12.0. See [DR-010](#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook) and [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook).)
 - **The base Dockerfile is still customisable.** Operators who need a different FROM image, extra baseline apt packages, locale settings, or non-root users edit `.nanogent/Dockerfile` (which is `type: code` in the update manifest, so it's overwritten on update — re-apply local changes after `nanogent update`). The marker line must stay intact.
 - **Resource requirements are surfaced as an advisory, not edited into compose.** `install.sh` only controls what's *installed* in the image; the actual `mem_limit` / `cpus` / GPU passthrough in `docker-compose.yml` stays operator-owned. As a v0.8.1 follow-up, plugins may optionally ship a `resources.json` next to `install.sh` declaring `minMemoryMb` / `minCpus` / `note`. `nanogent build` aggregates these across all plugins via `max()` (plugins share one container, so the floor is the hungriest plugin's floor — not the sum) and prints one advisory block at the end of the build, including which plugin set each max and whether `docker-compose.yml` already declares any resource limits. Missing, malformed, or partial `resources.json` files are fine: discovery warns and skips, and the build never fails on an advisory file. GPU passthrough remains out of scope — `resources.json` is advisory-only, no compose mutation, so it has nothing to declare about `device_requests` beyond a free-text `note`.
 
@@ -746,14 +738,14 @@ At runtime, the code was already OCP-clean: `template/nanogent.ts` walks `.nanog
 
 **What:**
 
-- **`bin/cli.ts` gets a shrunken `CORE_MANIFEST`.** 9 entries: `nanogent.ts`, `types.d.ts`, `Dockerfile`, `docker-compose.yml`, `.env.example`, `prompt.md`, `config.json`, `contacts.json`, `gitignore`. Every one is either `code` (always overwritten on update) or `config` (never touched on update). No plugin rows. `CORE_MANIFEST` is the non-pluggable substrate — nothing in it names any specific tool, channel, provider, history store, memory, or scheduler.
-- **`plugin.json` is required on every installable plugin.** Minimal schema: `name` (filesystem-safe, no slashes, no `..`), `type` (one of `tools`, `channels`, `providers`, `history`, `memory`, `scheduler`), optional `description`, optional `files` (explicit file list, relative paths, shallow). `name` and `type` together decide where the plugin lands: `.nanogent/<type>/<name>/`. JSON over YAML because the project already speaks JSON for every operator-facing file (`config.json`, `contacts.json`, `resources.json`, `schedules.json`) and a new parser dependency buys nothing.
+- **`bin/cli.ts` gets a shrunken `CORE_MANIFEST`.** 9 entries: `nanogent.ts`, `types.d.ts`, `Dockerfile`, `docker-compose.yml`, `.env.example`, `prompt.md`, `config.json`, `contacts.json`, `gitignore`. Every one is either `code` (always overwritten on update) or `config` (never touched on update). No plugin rows. `CORE_MANIFEST` is the non-pluggable substrate — nothing in it names any specific tool, channel, provider, or history store.
+- **`plugin.json` is required on every installable plugin.** Minimal schema: `name` (filesystem-safe, no slashes, no `..`), `type` (one of `tools`, `channels`, `providers`, `history` — v0.10.0 also accepted `memory` and `scheduler`, both removed by v0.12.0), optional `description`, optional `files` (explicit file list, relative paths, shallow). `name` and `type` together decide where the plugin lands: `.nanogent/<type>/<name>/`. JSON over YAML because the project already speaks JSON for every operator-facing file (`config.json`, `contacts.json`, `resources.json`, `schedules.json`) and a new parser dependency buys nothing.
 - **`readPluginManifest(sourceDir)` validates and parses.** Throws with a helpful message on missing file, invalid JSON, bad name, bad type, or `files` entries with `..` or absolute paths. Deliberately strict — a plugin that can't be trusted to ship a well-formed manifest can't be trusted to ship a well-formed `install.sh` either.
 - **`resolvePlugin(ref, baseDir): ResolvedPlugin`** is the single plugin-ref resolver. v1 supports local paths only — absolute, or relative to `baseDir`. When called from the profile path, `baseDir` is the profile file's directory. When called from `plugin add <path>`, `baseDir` is `process.cwd()`. The resolver returns `{ sourceDir, manifest, files }`, where `files` defaults to every non-hidden top-level file in the source dir when the manifest omits it.
 - **`installPlugin(resolved, nanogentDir, { force }): InstallPluginResult`** is the single plugin installer. Copies every file in `resolved.files` (plus `plugin.json` itself, always) into `.nanogent/<type>/<name>/`. Applies two filename conventions: a file literally named `gitignore` is copied as `.gitignore`, and `install.sh` is `chmod 0o755` after copy — both workarounds for `npm pack` stripping leading dots and executable bits. Refuses to overwrite an existing plugin dir unless `force` is set.
 - **`listInstalledPlugins(nanogentDir)`** walks `.nanogent/<type>/<name>/` and returns every dir containing a valid `plugin.json`. Dirs without one are logged and skipped with a migration-hint message. Dirs where the manifest declares a different `name` or `type` than the directory says are logged and skipped — a defence against name spoofing in third-party tarballs.
 - **`composeUpdateEntries(tplRoot, cwd, log): ManifestEntry[]`** drives `runUpdate`'s default path. Returns `CORE_MANIFEST` plus one `plugin`-typed entry per file in every installed plugin. For each installed plugin it tries to locate a shipped source at `<tplRoot>/<type>/<name>/`; if missing (third-party plugin), the whole plugin is logged as `skipped: ... (no shipped source)` and the operator keeps whatever they installed. If present, every file listed in the installed manifest is mapped back to the shipped source, with the forward `gitignore` → `.gitignore` rename applied on the dest side. The existing byte-equal / skip-unless-force semantics carry over unchanged.
-- **Profiles live under `template/profiles/`.** Two ship today: `default.json` (the 7 current defaults: `tools/claude`, `tools/schedule`, `channels/telegram`, `providers/anthropic`, `history/jsonl`, `memory/naive`, `scheduler/jsonl`) and `minimal.json` (empty plugin list — a deliberately-broken starting point for operators who want to author everything from scratch). Refs in the default profile point at `../tools/claude` etc., resolved relative to the profile file's directory. Operators point `nanogent init --profile <path>` at their own profile file to ship an opinionated set for their team.
+- **Profiles live under `template/profiles/`.** Two ship today: `default.json` (the 5 current defaults as of v0.12.0: `tools/claude`, `tools/schedule`, `channels/telegram`, `providers/anthropic`, `history/jsonl` — earlier revisions also listed `memory/naive` and `scheduler/jsonl`, both removed) and `minimal.json` (empty plugin list — a deliberately-broken starting point for operators who want to author everything from scratch). Refs in the default profile point at `../tools/claude` etc., resolved relative to the profile file's directory. Operators point `nanogent init --profile <path>` at their own profile file to ship an opinionated set for their team.
 - **`nanogent init` runs in three phases.** Phase 1: copy `CORE_MANIFEST` into `.nanogent/`. Phase 2: load the profile (default = `template/profiles/default.json`, overridable with `--profile <path>`) and install each referenced plugin via the same `resolvePlugin` + `installPlugin` pipeline third-party plugins use. Phase 3: run `runBuild()` to seed `Dockerfile.generated`. The post-init `next:` hint is unchanged.
 - **`nanogent plugin <sub>` is a new subcommand with three verbs.** `plugin list` walks the installed plugin tree and prints `<type>/<name> — <description>` lines. `plugin add <path> [--force]` resolves + installs + re-runs `runBuild` so any new `install.sh` makes it into the next image build. `plugin remove <name> [-f]` finds the matching installed plugin, prompts unless `-f`, and `rm -rf`s the directory before re-running `runBuild`. Ambiguous name matches (the same `<name>` under two different `<type>`s) error out with a hint to pass `<type>/<name>`.
 - **`nanogent update` composes entries from both phases automatically.** `runUpdate` now accepts an optional explicit `manifest` in `UpdateOptions` (tests use it), but its default behaviour is `composeUpdateEntries(tplRoot, cwd, log)`. The wire semantics for each entry type are unchanged: `code` always overwrites, `config` never touches, `plugin` byte-equal-or-skip-unless-force.
@@ -771,7 +763,7 @@ At runtime, the code was already OCP-clean: `template/nanogent.ts` walks `.nanog
 
 **Consequences:**
 
-- **`bin/cli.ts`'s functional code no longer hardcodes any plugin name.** No code path branches on `"claude"`, `"telegram"`, `"anthropic"`, or any other specific plugin. The only plugin vocabulary in logic is the generic extension-point names (`tools`, `channels`, `providers`, `history`, `memory`, `scheduler`) in `PLUGIN_TYPES`. A few plugin names still appear in prose — the `TELEGRAM_BOT_TOKEN` / `ANTHROPIC_API_KEY` post-init `next:` hint assumes the default profile, and the DR-011 / DR-013 context comments reference `tools/claude` as a historical example. These are strings the operator reads, not strings the CLI dispatches on; they have zero effect on how the CLI resolves, installs, or runs anything.
+- **`bin/cli.ts`'s functional code no longer hardcodes any plugin name.** No code path branches on `"claude"`, `"telegram"`, `"anthropic"`, or any other specific plugin. The only plugin vocabulary in logic is the generic extension-point names (`tools`, `channels`, `providers`, `history` as of v0.12.0 — earlier versions also included `memory` and `scheduler`) in `PLUGIN_TYPES`. A few plugin names still appear in prose — the `TELEGRAM_BOT_TOKEN` / `ANTHROPIC_API_KEY` post-init `next:` hint assumes the default profile, and the DR-011 / DR-013 context comments reference `tools/claude` as a historical example. These are strings the operator reads, not strings the CLI dispatches on; they have zero effect on how the CLI resolves, installs, or runs anything.
 - **The `nanogent` npm package still ships zero-network.** Defaults are vendored under `template/<type>/<name>/` exactly as before (the profile just points at relative paths), so `nanogent init` makes no network calls. Nothing about the install experience got slower or less reliable.
 - **Third-party plugins are first-class.** Any operator can `mkdir -p plugins/tools/mytool`, drop a `plugin.json` + `index.ts` + optional `install.sh`, and run `nanogent plugin add ./plugins/tools/mytool`. The plugin appears in `plugin list` alongside the defaults. It survives `nanogent update`. If it ships an `install.sh`, the next `nanogent build` layers its dependencies into the image. No core edits, no forking, no manual file copying.
 - **`plugin.json` is now a required plugin-author artifact.** Existing v0.9.0 installs won't have one. Since v0.9.0 isn't published to npm and the user base is effectively "people who ran `nanogent init` from this repo in the last few days", the migration is: delete `.nanogent/` and re-run `nanogent init`, or hand-author a `plugin.json` in each plugin dir. Documented in the README "Migrating from 0.9.0" section. `listInstalledPlugins` logs a clear warning for dirs missing a manifest rather than silently ignoring them.
@@ -923,7 +915,7 @@ Methods on `Portable<T>` are **required**, not optional. If a plugin type declar
 
 1. **History** — source of truth. Needs full `export`/`import`. Envelope is trivially `{ version, messages: contactId → messages[] }`.
 
-2. **Memory** — derived view on history. Does NOT need `export`/`import`. The swap story is "reindex from the history store": the new plugin's `init()` walks history via the existing `ctx.history` handle and rebuilds its index. This is already possible under the current contract; v0.12.0 will make "initial backfill on empty index" an explicit convention in the memory plugin-author checklist.
+2. **Retrieval tools** (RAG, summary, mem0-style — tools that contribute context via DR-016's `contributeContext` hook and maintain a derived index via `onHistoryAppended`) — derived view on history. Do NOT need `export`/`import`. The swap story is "reindex from the history store": the new tool's `start(ctx)` walks history via the existing `ctx.history` handle and rebuilds its index. No plugin-to-plugin data contract is needed because the underlying data (history) is already portable via this DR's `HistoryStorePlugin` envelope. (Prior to v0.12.0 this story was framed around the `memory/<name>/` plugin type; the memory type has since been removed — see [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) — but the "reindex from history" principle still applies to any context-contributing tool.)
 
 3. **Proactive tools that hold state (`tools/schedule` today)** — source of truth for *definitions*, plugin-internal for *execution log*. `export`/`import` covers definitions only. Execution log is deliberately non-portable — it's implementation telemetry, not data the operator cares about preserving across a swap. This is why `tools/schedule` keeps definitions (`schedules.json`) and the log (`log.jsonl`) in separate files, so a future `export()` can dump one and ignore the other.
 
@@ -968,10 +960,10 @@ v0.11.0 reshapes several plugin types (history, memory, the new `tools/schedule`
 **Consequences (v0.11.0 scope — no code, just shape).**
 
 - **No `Portable<T>` type is added to `types.d.ts` yet.** It lands in v0.12.0 when implementation is wired up. DR-015 describes the shape in prose so authors know what to design toward.
-- **`HistoryStorePlugin`, `MemoryPlugin`, and `ToolPlugin` interfaces are unchanged** from the v0.11.0 refactor. They do not yet extend `Portable<T>`.
+- **`HistoryStorePlugin` and `ToolPlugin` interfaces are unchanged** from the v0.11.0 refactor (v0.11.0 also listed `MemoryPlugin` here; that type was removed in v0.12.0 — see [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook)). They do not yet extend `Portable<T>`.
 - **`bin/cli.ts` does not gain `plugin migrate` / `plugin export` / `plugin import` subcommands yet.** Those land with v0.12.0.
 - **`tools/schedule` keeps definitions and log in separate files** (`schedules.json` + `log.jsonl`), deliberately, so v0.12.0's `export()` is a one-line `readFileSync(schedulesPath)`.
-- **Memory swap story will be "reindex from history," not "export/import the index."** v0.12.0 will document this in the memory plugin-author checklist.
+- **Retrieval-tool swap story is "reindex from history," not "export/import the index."** v0.12.0's [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) documents this in the context-contributing tool author checklist.
 
 **Consequences (v0.12.0 scope — for future reference).**
 
@@ -993,6 +985,113 @@ v0.11.0 reshapes several plugin types (history, memory, the new `tools/schedule`
 - [ ] Treat `contactId` as an opaque identifier in every envelope. Do not assume it's a username or a numeric ID. Migration between plugins must preserve contactIds byte-for-byte.
 - [ ] Version your plugin's internal schema from day one, even if v1 is the only version. Bumping later is a breaking change; introducing versioning later is a coordination nightmare.
 - [ ] When in doubt about whether to ship state inside the `export()` envelope or behind a re-derive-from-source pattern, ask: "is this data that the operator would mourn losing if they swapped plugins?" If yes, it's portable; if no, leave it out and let the new plugin recompute.
+
+### DR-016: Memory is not a plugin type — tools contribute context via a hook
+
+**Status:** v0.12.0 reverses [DR-009b](#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history). The `memory/<name>/` extensibility point is deleted. Core always windows raw history via boundary-aware rotation as a correctness invariant. Any tool can push additional system-prompt text into the next turn via a new optional `ToolPlugin.contributeContext(ctx)` hook. Smarter retrievers (RAG, summary, mem0) now ship as ordinary tool plugins — e.g. a future `tools/memory-rag` — and maintain their own derived state via optional `onHistoryAppended` / `onHistoryRetracted` / `onClear` hooks. Plugin-type count drops from five to four.
+
+**Why the reversal.**
+
+DR-009b's framing was "memory is a plugin type because retrieval is an active research area and we want swappability." In practice v0.5.0 – v0.11.0 shipped exactly one memory plugin — `memory/naive` — which was a 40-line no-op wrapper: `recall()` called `history.read()` + `rotateHistory()`, and `onAppend` / `onRetract` / `onClear` were empty stubs. The only real logic it owned was `rotateHistory` / `isTurnStart`, and that is a **correctness invariant of the Anthropic API** (never hand the provider an orphan `tool_result` at the head of the messages array), not a retrieval strategy. Core has to respect the invariant whether or not a memory plugin is loaded — otherwise a buggy memory plugin would crash every turn. So the plugin type added one loader, one ctx type, one `die()` path, and one required slot in the default profile — all in exchange for wrapping a function that already lived in core until v0.4.x.
+
+The swappability argument ("you want to drop in a RAG retriever") turned out to be a mismatch between what the `MemoryPlugin` contract looked like and what a RAG retriever actually needs to do:
+
+1. **Recall is not hook-shaped — but it is also not the right swap point.** `MemoryPlugin.recall` returned both `messages` and `systemContext`. The `messages` slot invited smart retrievers to rewrite the provider's messages array, which re-introduced every correctness problem core's rotation was trying to prevent (orphan `tool_result`, broken user/assistant alternation, fake turns the LLM "remembers"). Most RAG retrievers don't actually want to rewrite history — they want to inject retrieved chunks as reference material. That's system-prompt text, not a fake conversation turn. Once you accept that, the whole `recall()` contract collapses to "return a text block," which is smaller than a plugin type.
+
+2. **The interesting part of a retriever is the *index*, not the *recall call*.** A RAG tool needs `onHistoryAppended` to index new messages and `contributeContext` to return a ranked slice at turn time. Both are naturally optional hooks on a generic interface, not required methods on a capability type. Most tools don't implement them; a few do.
+
+3. **The pattern generalises beyond retrieval.** Once you have `contributeContext?` on every tool, you unlock use cases that previously had no home. A clock tool injects the current time every turn (today it either lives as stale text in the base system prompt or wastes a tool-call round-trip every turn). A location tool injects the user's current location. A project-status tool injects CI state. A schedule-awareness tool injects "next meeting in 15 min." None of these are "memory" in any reasonable sense, but all of them have the same shape as a RAG retriever: "reactively inject extra context into the next provider call." Making `contributeContext` a hook on `ToolPlugin` covers all of them with one seam; making it a method on a dedicated `MemoryPlugin` forced each of those into being a misnamed memory plugin or inventing a separate plugin type.
+
+**What (v0.12.0 shape).**
+
+```ts
+interface ToolPlugin {
+  // ...execute + existing start() lifecycle hook
+
+  // Optional per-turn hook — called once before provider.chat(). Return a
+  // text block to inject into the system prompt, or null to skip. Failures
+  // are logged per-tool; the turn proceeds without that tool's contribution.
+  contributeContext?(ctx: ToolContextCtx): Promise<string | null>;
+
+  // Optional history-lifecycle hooks — called after the named operation
+  // commits against the history store. Tools that maintain derived indexes
+  // (vector stores, summaries) use these to stay in sync. Failures are
+  // logged but do not block the turn.
+  onHistoryAppended?(contactId: string, messages: HistoryMessage[]): Promise<void>;
+  onHistoryRetracted?(contactId: string, count: number): Promise<void>;
+  onClear?(contactId: string): Promise<void>;
+}
+
+interface ToolContextCtx {
+  projectName: string;
+  contactId: string;
+  channel: string;
+  chatId: string;
+  query: string;                              // latest user text — for RAG ranking
+  messages: ReadonlyArray<HistoryMessage>;    // the current window (read-only)
+  log(...args: unknown[]): void;
+}
+
+interface ToolStartCtx {
+  // ...existing fields
+  history: HistoryStorePlugin;                // handle for tools that reindex on boot
+}
+```
+
+Core's turn loop is now:
+
+1. Read last `NANOGENT_HISTORY_WINDOW * 2` messages from the history store.
+2. `rotateHistory()` to enforce boundary-aware windowing (correctness invariant).
+3. Gather `contributeContext` results from every loaded tool in parallel. Each call is wrapped in try/catch; a throwing tool degrades its own contribution but never crashes the turn. Successful strings are concatenated into the system prompt after the base block.
+4. `provider.chat({ system, messages, tools })`.
+5. On history commit/retract/clear, fan out the matching hook to every tool that subscribes, in parallel, each wrapped in try/catch.
+
+**Text only, never messages-array mutation.** This is the hard rule. Tools live in the system-prompt lane; core owns the messages path. A retriever that wants to inject reference material returns a text block like `## Relevant older context\n- ...\n- ...\n` — it does not splice fake turns into the messages array. Smart windowing ("use these 40 semantically-selected messages from the last 500 instead of the default window") is deliberately unsupported as a goal: almost all of its practical value is recoverable via system-prompt injection, and the correctness cost of letting plugins mutate the messages array is high. If a future use case genuinely requires it, we revisit — but the evidence so far is that it doesn't.
+
+**Permission gating.** `contributeContext` fires on every loaded tool that implements it, regardless of whether the current turn's `effectiveTools` permits the tool to be *called* by the LLM. The two axes are separate on purpose:
+
+- `effectiveTools` governs "can the LLM invoke `tool.execute()` on this turn?" — a permission over reactive tool use.
+- `contributeContext` governs "does this tool push context into the next turn?" — a proactive behavior owned by the tool itself.
+
+An operator who installs a clock tool globally wants every turn to see the current time, regardless of which user is speaking. A RAG tool that holds cross-user embeddings is responsible for scoping its own output to `ctx.contactId` — if it leaks, that's a tool bug, not a core bug. Core provides the identifiers (`contactId`, `channel`, `chatId`) in `ToolContextCtx`; the tool does the right thing with them. This matches DR-014: core provides primitives, plugins own correctness of their own state.
+
+**Why a capability interface is *not* used here (contrast with DR-015).**
+
+[DR-015](#dr-015-portable-state-via-per-type-data-contracts) argues for named capability interfaces (`Portable<T>`) over optional methods when the capability is something a plugin type is *expected to provide*. `contributeContext` is the opposite: it is something most tools *don't* provide. Forcing it onto a named capability interface (`interface ContextContributor { contributeContext(...) }`) would either be noise that every tool has to opt out of, or create a second plugin subtype alongside `ToolPlugin` that core has to discover separately. Optional method on the base `ToolPlugin` interface is genuinely the right shape — the capability is genuinely optional in the same way `ToolPlugin.start` is, and the coupling between "the tool has an execute method" and "the tool happens to also contribute context" is zero. The DR-015 rule about named capabilities still applies for things like `Portable<T>` where portability is a per-type contract with typed envelopes; it does not apply to per-instance lifecycle opt-ins.
+
+**Consequences.**
+
+- **The plugin-type table drops from five to four.** `memory/<name>/` is gone. `PLUGIN_TYPES` in `bin/cli.ts` shrinks to `['tools', 'channels', 'providers', 'history']`.
+- **`memory/naive` is deleted entirely.** Its two utility exports (`rotateHistory`, `isTurnStart`) move back into `nanogent.ts`, which is where they lived until v0.4.x. The move is a reversion, not an invention.
+- **`MemoryPlugin`, `MemoryCtx`, and `RecallResult` are removed from `types.d.ts`.** `ToolPlugin` gains four optional hooks. `ToolContextCtx` is added. `ToolStartCtx` gains `history`.
+- **`NANOGENT_MEMORY_WINDOW` becomes `NANOGENT_HISTORY_WINDOW`.** It's now a core concern (it gates the base window core always produces), not a plugin knob.
+- **The default window logic lives in core.** `runTurn` calls `history.read(contactId, { limit: HISTORY_WINDOW * 2 })` + `rotateHistory(..., HISTORY_WINDOW)` unconditionally. Tools have no knob on this — the base window is an invariant, not a policy decision.
+- **`template/profiles/default.json` drops the `memory/naive` ref.** The minimal profile's self-description ("channel + provider + history is enough to boot") finally matches runtime behavior — there was an unintentional discrepancy where `template/profiles/minimal.json` advertised memory as optional but `nanogent.ts` still `die()`'d without one. v0.12.0 closes that drift.
+- **The turn loop stops carrying `recalled.systemContext` through nested `tool_use` iterations.** Context is gathered once per top-level turn and reused across every provider call until the turn resolves — same as it was under `memory.recall` semantics, but now the mechanism is a Promise.all over `contributeContext`.
+- **Cache-control placement is unchanged.** The base system prompt still carries the `ephemeral` cache breakpoint; tool-contributed context blocks still sit after it. A volatile clock contribution still invalidates after-breakpoint bytes on every turn; tool authors who want cache friendliness keep their output stable (same rule DR-009b had for `systemContext`).
+- **`onHistoryAppended` awaits are parallel.** All subscribing tools' hooks run concurrently via `Promise.all`. A slow tool delays the turn by its own duration; a buggy tool is caught and logged per-hook so others proceed. This matches the semantics v0.5.0 had for `memory.onAppend` (blocking) with the scaling fix that multiple subscribers don't serialise.
+- **Migration story is code-only.** Operators running the default profile can remove their `.nanogent/memory/` folder manually after updating; `nanogent update` prunes stale plugins via the standard DR-013 path as long as `default.json` no longer references them. Operators who had a custom memory plugin reimplement it as a tool plugin with `contributeContext` + `onHistoryAppended` — the code changes are a one-to-one rename plus returning a string instead of `RecallResult`, since the `recall(contactId, query)` signature already matched and the `messages` slot was never safe to mutate.
+- **DR-015 point 2 (memory portability) is unaffected by the reversal but its framing shifts.** The "memory is a derived view on history, so reindex from history on boot" principle still holds — it now applies to any tool plugin that maintains a derived index via `onHistoryAppended`. The swap story for future `tools/memory-rag` → `tools/memory-vector` is "stop the old tool, start the new tool, its `start(ctx.history)` backfills the new index from history." No plugin-to-plugin export/import primitive is needed, because the underlying data (history) is already portable via DR-015's `HistoryStorePlugin` envelope.
+
+**Open calls settled during design.**
+
+- **Should `contributeContext` receive the `messages` array as input?** Yes — passed read-only via `ToolContextCtx.messages`. A RAG retriever needs to know what's already in the window so it can rank against it and avoid redundant injection. The coupling is one-directional (tool reads core's window, never writes it), so the cost is low.
+- **Should core validate that tool contributions haven't broken the messages array?** No — tools cannot touch the messages array at all. There is nothing to validate. The contract enforces this at the type level (`contributeContext` returns `string | null`, full stop).
+- **Should `effectiveTools` gate `contributeContext`?** No (discussed above). Permission gates tool invocation, not proactive context. Tools self-scope by `contactId`.
+- **Should hook failures crash the turn?** No — per-tool try/catch, log, continue. Same pattern as `start?()`, `channel.start()`, and historical `memory.onAppend`.
+- **Ordering of multiple contributions?** Deterministic: plugin discovery order (`PLUGIN_ROOTS` declaration order, then alpha within root). Same rule as `install.sh` discovery and resources discovery. Documented so tool authors can rely on it.
+
+**Checklist for plugin authors writing a context-contributing tool:**
+
+- [ ] Return system-prompt text only. Never try to mutate the messages array (the contract does not expose it as mutable, but the reminder matters: don't fake conversation turns, don't emit bare `tool_result` blocks, don't invent user/assistant alternation). If your instinct says "I want to rewrite the window," re-read this DR — the answer is almost always "inject a text block that the model treats as reference material."
+- [ ] Self-scope by `ctx.contactId`. If your tool holds any per-user state (vector embeddings, summaries, cached facts), filter it by `contactId` before returning. Core will not do this for you — leaking across users is a tool bug.
+- [ ] Return `null` or an empty string when you have nothing to say. Tools should *not* emit filler text every turn; churn in the system-prompt bytes after the cache breakpoint kills Anthropic's prompt cache.
+- [ ] Keep your output stable across turns when possible. If the only thing that changes between turns is one field (e.g., `now: 2026-04-15T14:32:00Z`), structure your block so the stable part comes first and the volatile part comes last, so partial cache reuse remains possible.
+- [ ] Budget your tokens. Core does not police context-contribution length. If your tool returns 10k tokens every turn, you will blow the context window — that's your operator's bill, not core's job to prevent.
+- [ ] If you maintain a derived index, implement `onHistoryAppended` to keep it in sync with new messages, `onHistoryRetracted` to invalidate on skip/error, and `onClear` to wipe on `/clear`. Reindex from `ctx.history` inside `start(ctx)` if you discover an empty or missing index on boot.
+- [ ] If your index is per-`contactId`, partition it at the first level (dir, table, namespace). Do not store embeddings from different users in one undifferentiated bag.
+- [ ] Document your token footprint and any external dependencies (vector DB, embedding API) in your plugin's `README.md` so operators know what they're installing.
+- [ ] State goes under `pluginDir/state/`. Add a `gitignore` listing `state/` to `plugin.json.files`. Per DR-014 and the convention every other stateful plugin already uses.
 
 ---
 
@@ -1018,7 +1117,7 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 - **Admin-convenience `link_contact` CLI command** — operators edit `contacts.json` directly in v0.4.0. A CLI wrapper is a candidate for v0.4.x.
 - **Hot-reload of `contacts.json`** — file-watch or mtime-check for on-the-fly updates. Probably v0.4.1.
 - **Per-(user, chat) role hierarchies** — use separate nanogent installs for different trust tiers. If the separate-install pattern proves insufficient, revisit.
-- **Per-user learnings scoping** — learnings are currently global. Per-contact scoping might come later if prompt-injection-via-learning becomes a real problem. (Note: once v0.5.0 memory plugins land, per-contact scoping is most naturally implemented as a memory plugin that treats learnings as structured context rather than as a core change.)
+- **Per-user learnings scoping** — learnings are currently global. Per-contact scoping might come later if prompt-injection-via-learning becomes a real problem. (Note: per-contact scoping is most naturally implemented as a context-contributing tool plugin that reads `ctx.contactId` and injects the matching subset via `contributeContext` — see [DR-016](#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) — rather than as a core change.)
 - **Provider-level fallback as a core feature** — handled inside a single provider plugin, not core. Waiting for a concrete use case.
 - **Tool-level audit logging** — structured audit trail beyond log greps. Not until someone asks.
 - **Dynamic runtime permission updates** without restart — low priority; requires hot-reload plumbing.
@@ -1037,5 +1136,6 @@ These are capabilities we've discussed and deliberately deferred. They may land 
 - **0.6 (2026-04-15)** — Added DR-012 (Docker is the only supported runtime). v0.9.0 removes the host-node path and the `--node`/`--docker` flags: `nanogent start` always runs `docker compose up --build`, the CLI fails fast if `docker` is missing from PATH, `config.json` no longer carries a `docker` field, and `types.d.ts` drops it from `Config`. Rationale: DR-011's `install.sh` contract is inherently container-shaped, so supporting a host runtime would force a dual-install contract that doubles plugin-author burden and splits the test matrix. Removed the "node-mode users unaffected" consequence from DR-011 and revised the auto-build trigger wording from `nanogent start --docker` to `nanogent start`.
 - **0.7 (2026-04-15)** — Added DR-013 (core and plugin installation are decoupled; plugins are self-describing, defaults are data). v0.10.0 shrinks `CORE_MANIFEST` to 9 non-pluggable files and moves the 7 default plugins out of `bin/cli.ts` and into a new `template/profiles/default.json` whose refs point at the vendored plugin dirs. Every plugin now ships a required `plugin.json` (name, type, optional description, optional files list); `readPluginManifest`, `resolvePlugin`, `loadProfile`, `installPlugin`, `listInstalledPlugins`, and `composeUpdateEntries` form a uniform plugin-lifecycle pipeline that third-party plugins and shipped defaults share. `nanogent init` runs in three phases (core copy → profile-driven plugin install → `runBuild` seed) and accepts `--profile <path>` for custom profiles. A new `nanogent plugin list/add/remove` subcommand exposes the lifecycle to operators. `runUpdate` composes entries from `CORE_MANIFEST` + installed-plugin discovery by default, preserving the existing code/plugin/config semantics. Deferred: git/npm plugin refs and a plugin lock file. `bin/cli.ts` no longer contains any plugin-name string literals.
 - **0.8 (2026-04-15)** — Added DR-014 (minimal core↔plugin coupling) and DR-015 (portable state via per-type data contracts). Rewrote DR-010 as a reversal of the v0.7.0 scheduler-plugin design: the typed `SchedulerPlugin` seam is gone, time-based proactive triggers now live inside `tools/schedule` via an optional `ToolPlugin.start(ctx)` lifecycle hook returning a stop fn, and the `ToolStartCtx` hands plugins `pluginDir` + a `fireSystemTurn` primitive. `fireSystemTurn` is un-exported from `nanogent.ts` — plugins reach it only through ctx. `HistoryStoreCtx` and `MemoryCtx` drop their `stateDir` field: plugins now write state under `pluginDir/state/`, matching the convention `tools/claude` already used since v0.8.0. The plugin-type table drops from six rows to five (`scheduler/<name>/` is gone; `tools`, `channels`, `providers`, `history`, `memory` remain). DR-015 ships as principle-only in v0.11.0 — the `Portable<T>` interface, `export`/`import` methods on history, and `nanogent plugin migrate` / `export` / `import` CLI verbs are deferred to v0.12.0 but the principle influences v0.11.0's data layout (schedule definitions and execution log stay in separate files so future `export()` can dump the portable half cleanly).
+- **0.9 (2026-04-15)** — Added DR-016 (memory is not a plugin type; tools contribute context via a hook). v0.12.0 deletes the `memory/<name>/` extensibility point entirely: `MemoryPlugin`, `MemoryCtx`, and `RecallResult` are removed from `types.d.ts`; `memory/naive` is deleted; `rotateHistory` / `isTurnStart` move back into `nanogent.ts` as a correctness invariant (they lived there until v0.4.x). `ToolPlugin` gains four optional hooks — `contributeContext(ctx)` (per-turn system-prompt text injection), `onHistoryAppended(contactId, messages)`, `onHistoryRetracted(contactId, count)`, `onClear(contactId)` — and `ToolStartCtx` gains a `history: HistoryStorePlugin` handle so stateful retrieval tools can reindex on boot. Smart retrievers (RAG, summary, mem0) now ship as ordinary tool plugins that implement `contributeContext` + `onHistoryAppended`. The same hook also unlocks non-memory use cases that previously had no home — clock, location, schedule-awareness, project-status tools all inject per-turn context through the same seam. Plugin-type count drops from five to four (`tools`, `channels`, `providers`, `history`). Reversed DR-009b in place with a forward pointer; updated DR-011's "five plugin types" consequence and the PLUGIN_ROOTS walk list, DR-013's CORE_MANIFEST and plugin.json schema prose, DR-014's history/memory migration section (now history-only), and DR-015 point 2 (memory portability recast as retrieval-tool portability) + its v0.11.0 consequences list. Updated the architecture tree, plugin-type table, asymmetry bullets, "writing a plugin" sections (replaced "Writing a memory plugin" with "Writing a context-contributing tool plugin"), and the out-of-scope note about learnings scoping. `PLUGIN_TYPES` in `bin/cli.ts` shrinks to four. `template/profiles/default.json` drops the `../memory/naive` ref; the minimal profile's documented contract ("channel + provider + history is enough to boot") finally matches runtime behavior — closing the v0.11.0 drift where `minimal.json` advertised memory as optional but `nanogent.ts` still `die()`'d without one.
 
 When adding a new decision or updating an existing one, add a line here with the date and a one-sentence summary.

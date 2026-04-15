@@ -159,10 +159,6 @@ your-project/
         index.ts
         README.md
         state/                ← plugin-owned runtime data (gitignored)
-    memory/
-      naive/                  ← default memory plugin (recent-window retrieval)
-        index.ts
-        README.md
     tools/
       schedule/               ← default schedule tool (reactive CRUD + proactive tick loop, self-contained)
         index.ts
@@ -212,7 +208,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 - `chatModel` — Anthropic model for the chat-agent routing layer. Default `claude-haiku-4-5` (cheap + fast)
 - `maxTokens` — max output tokens per chat-agent turn
 
-> **Note on `maxHistory`**: v0.4.x had a `maxHistory` knob here. In v0.5.0, windowing is owned by the memory plugin, not the core. Set it via `NANOGENT_MEMORY_WINDOW` (read by `memory/naive`) or swap in a different memory plugin. See [DR-009b](DESIGN.md#dr-009b-memory-is-a-separate-pluggable-indexerretriever-over-history).
+> **Note on `maxHistory`**: v0.4.x had a `maxHistory` knob here. v0.5.0 – v0.11.0 moved windowing into a memory plugin (`NANOGENT_MEMORY_WINDOW`). v0.12.0 deletes the memory plugin type entirely: core owns boundary-aware history windowing again as a correctness invariant. Set the window via `NANOGENT_HISTORY_WINDOW=N` in `.env` (default: 80 messages). To inject extra context per turn (RAG, summary, clock, project status, etc.) ship a tool plugin that implements the `contributeContext` hook — see [DR-016](DESIGN.md#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook).
 
 **`.nanogent/contacts.json`** (access control + identity — committed):
 
@@ -707,6 +703,114 @@ If you were using the scheduler tool, schedules and their execution log will con
 
 See [`.nanogent/tools/schedule/README.md`](template/tools/schedule/README.md), [DESIGN.md DR-010](./DESIGN.md#dr-010-proactive-triggers-live-inside-tool-plugins-via-the-lifecycle-hook), and [DR-014](./DESIGN.md#dr-014-minimal-coreplugin-coupling) for the full rationale.
 
+### Migrating from 0.11.0
+
+v0.12.0 **collapses the memory plugin type** into the tool extensibility point, mirroring what v0.11.0 did for the scheduler plugin type. The `memory/<name>/` directory is gone; any tool can now inject extra system-prompt text per turn via a new optional `ToolPlugin.contributeContext(ctx)` hook, and maintain a derived index via optional `onHistoryAppended` / `onHistoryRetracted` / `onClear` hooks. Core owns boundary-aware history windowing again (as it did until v0.4.x) — `rotateHistory` / `isTurnStart` move back into `nanogent.ts` as a correctness invariant of the Anthropic API. See [DESIGN.md DR-016](./DESIGN.md#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) for the full rationale.
+
+What's new:
+
+- **The `memory/<name>/` plugin type is gone.** `MemoryPlugin`, `MemoryCtx`, and `RecallResult` are removed from `types.d.ts`. `memory/naive` is deleted. `PLUGIN_TYPES` in `bin/cli.ts` drops `'memory'`, leaving four types: `tools`, `channels`, `providers`, `history`.
+- **`ToolPlugin` gains four optional hooks.** `contributeContext(ctx: ToolContextCtx): Promise<string | null>` is called once per turn before `provider.chat()` — return a system-prompt text block or `null` to skip. `onHistoryAppended(contactId, messages)` / `onHistoryRetracted(contactId, count)` / `onClear(contactId)` fire after the matching history operation commits so tools can keep derived indexes (RAG vectors, summaries) in sync. All four are optional, parallel-awaited, wrapped in per-tool try/catch — a buggy tool degrades its own contribution but never crashes the turn.
+- **`ToolStartCtx` gains `history: HistoryStorePlugin`.** Retrieval tools can capture this at start time and reindex from history on first boot or after a schema bump.
+- **`ToolContextCtx` is a new type** handed to `contributeContext()`. It carries `projectName`, `contactId`, `channel`, `chatId`, `query` (latest user text for RAG ranking), and `messages` (the current window, read-only so tools can rank against it without duplicating).
+- **`NANOGENT_MEMORY_WINDOW` → `NANOGENT_HISTORY_WINDOW`.** The window knob is now a core env var, default 80. The old name is no longer read.
+- **`template/profiles/default.json` drops the `../memory/naive` ref** — it's down to five plugins (`tools/claude`, `tools/schedule`, `channels/telegram`, `providers/anthropic`, `history/jsonl`).
+- **`template/profiles/minimal.json`'s documented contract finally matches runtime behavior.** v0.11.0 advertised memory as optional ("at least one channel, one provider, and one history store") but `nanogent.ts` still `die()`'d without a memory plugin. v0.12.0 closes the drift — a channel + provider + history store is now genuinely enough to boot.
+
+Breaking changes (pre-publish scope — nanogent is not on npm yet):
+
+1. **Any custom memory plugin needs to be rewritten as a tool plugin.** The signature changes are small but real: `MemoryPlugin.recall(contactId, query)` becomes `ToolPlugin.contributeContext({ contactId, query, messages, ... })` returning `string | null` instead of `{ messages, systemContext? }`. The `messages` slot was never safe to mutate (core's rotation is the correctness invariant) so the new shape drops it. `onAppend` / `onRetract` / `onClear` rename to `onHistoryAppended` / `onHistoryRetracted` / `onClear`.
+2. **The `.nanogent/memory/` directory is orphaned.** `nanogent update` will not auto-remove it — plugins own their state and core never reaches into plugin folders. Remove it manually after updating.
+3. **`NANOGENT_MEMORY_WINDOW` env var is no longer read.** Rename it to `NANOGENT_HISTORY_WINDOW` in your `.env`. No warning is logged if the old name is set — it silently has no effect.
+
+Migration (cleanest path):
+
+```bash
+# 1. Stop the agent if it's running.
+docker compose -f .nanogent/docker-compose.yml down
+
+# 2. Re-run init against a clean .nanogent/ if you have no local edits.
+rm -rf .nanogent
+npm install -g nanogent@latest
+nanogent init
+nanogent start
+
+# Or, if you have local edits worth preserving (the default case — config,
+# contacts, prompt, learnings, conversation history are all preserved):
+npm install -g nanogent@latest
+nanogent update
+
+# 3. Remove the orphaned memory plugin dir. Core no longer loads it, and the
+#    naive plugin was a no-op wrapper anyway — core's built-in windowing is
+#    byte-equivalent.
+rm -rf .nanogent/memory
+
+# 4. If you had NANOGENT_MEMORY_WINDOW set, rename it.
+$EDITOR .nanogent/.env
+# NANOGENT_MEMORY_WINDOW=120  →  NANOGENT_HISTORY_WINDOW=120
+
+# 5. Restart.
+nanogent start
+```
+
+**If you had a custom memory plugin under `.nanogent/memory/<name>/`**, port it to a tool plugin under `.nanogent/tools/<name>/`:
+
+```ts
+// Before (v0.11.0 memory plugin)
+import type { MemoryPlugin, MemoryCtx, RecallResult } from '../../types.d.ts';
+
+const plugin: MemoryPlugin = {
+  name: 'my-rag',
+  async init(ctx: MemoryCtx) { /* ... */ },
+  async recall(contactId, query) {
+    const snippets = await rank(contactId, query);
+    return { messages: [], systemContext: `## Relevant older context\n${snippets}` };
+  },
+  async onAppend(contactId, messages) { /* index new messages */ },
+  async onRetract(contactId, count) { /* invalidate */ },
+  async onClear(contactId) { /* wipe */ },
+};
+export default plugin;
+
+// After (v0.12.0 context-contributing tool)
+import type { HistoryStorePlugin, ToolPlugin, ToolStartCtx, ToolContextCtx, HistoryMessage } from '../../types.d.ts';
+
+let history: HistoryStorePlugin | null = null;
+
+const plugin: ToolPlugin = {
+  name: 'my-rag',
+  description: 'RAG retriever (no direct LLM-callable surface).',
+  input_schema: { type: 'object', properties: {}, required: [] },
+  async execute() { return 'This tool contributes context automatically; it is not meant to be called directly.'; },
+
+  async start(ctx: ToolStartCtx) {
+    history = ctx.history;
+    // Reindex from history on first boot if our index is empty.
+  },
+
+  async contributeContext(ctx: ToolContextCtx): Promise<string | null> {
+    const snippets = await rank(ctx.contactId, ctx.query);
+    if (!snippets) return null;
+    return `## Relevant older context\n${snippets}`;
+  },
+
+  async onHistoryAppended(contactId: string, messages: HistoryMessage[]) { /* index new messages */ },
+  async onHistoryRetracted(contactId: string, count: number) { /* invalidate */ },
+  async onClear(contactId: string) { /* wipe */ },
+};
+export default plugin;
+```
+
+The `execute()` method is required on every tool (it's on the ToolPlugin contract) even for tools whose value is entirely in `contributeContext`. Return a clear "not meant to be called directly" string, and don't list the tool in any user's `tools` / `guestTools` allowlist — it'll never be invoked by the LLM.
+
+**Why the changes:**
+
+- **`memory/naive` was a no-op wrapper.** It called `history.read()` + `rotateHistory()` and returned the result. `onAppend` / `onRetract` / `onClear` were empty stubs with comments saying "history is the index." The only logic it actually owned was `rotateHistory` / `isTurnStart`, which is a correctness invariant of the Anthropic API (never hand the provider an orphan `tool_result`) — that belongs in core, not in a plugin.
+- **The pattern generalises beyond retrieval.** Once `contributeContext` exists on every tool, use cases that previously had no home — a clock tool that injects the current time every turn, a location tool, a project-status tool, a schedule-awareness tool — all share the same seam as RAG and summary memory. Making it a memory-plugin method would have forced each of those into being a misnamed memory plugin.
+- **Minimal profile was already advertised this way.** `template/profiles/minimal.json` said "channel + provider + history is enough to boot," but `nanogent.ts` still `die()`'d without a memory plugin. v0.12.0 closes the drift.
+
+See [`template/tools/claude/README.md`](template/tools/claude/README.md) for the existing tool-plugin shape and [DESIGN.md DR-016](./DESIGN.md#dr-016-memory-is-not-a-plugin-type-tools-contribute-context-via-a-hook) for the full design rationale including the "text-only, never messages-array mutation" rule and the permission-gating decision.
+
 Once running, a client just sends any text to the bot. The chat agent:
 
 1. Decides whether the message is addressed to it (calls `skip` if not)
@@ -756,7 +860,7 @@ A minimum-viable `plugin.json`:
 }
 ```
 
-`type` decides where the plugin lives on disk (`tools`, `channels`, `providers`, `history`, `memory`); `name` must match the directory name. `files` is optional — when omitted, the installer copies every non-hidden top-level file in the plugin dir. See [DESIGN.md DR-013](./DESIGN.md#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data) for the full manifest contract.
+`type` decides where the plugin lives on disk (`tools`, `channels`, `providers`, `history`); `name` must match the directory name. `files` is optional — when omitted, the installer copies every non-hidden top-level file in the plugin dir. See [DESIGN.md DR-013](./DESIGN.md#dr-013-core-and-plugin-installation-are-decoupled--plugins-are-self-describing-defaults-are-data) for the full manifest contract.
 
 Minimum viable tool — `rag/index.ts`:
 
@@ -863,7 +967,7 @@ The default `claude` tool is the second case — it ships `.nanogent/tools/claud
 
 ## Managing plugins
 
-Same lifecycle applies to every plugin type — tools, channels, providers, history, memory. `nanogent init` installs the plugins listed in the active profile (default: `template/profiles/default.json`), and after that `nanogent plugin` manages anything you want to add or remove:
+Same lifecycle applies to every plugin type — tools, channels, providers, history. `nanogent init` installs the plugins listed in the active profile (default: `template/profiles/default.json`), and after that `nanogent plugin` manages anything you want to add or remove:
 
 ```bash
 nanogent plugin list                 # what's installed, with descriptions
@@ -1021,7 +1125,6 @@ ln -s $REPO/tools            .nanogent/tools
 ln -s $REPO/channels         .nanogent/channels
 ln -s $REPO/providers        .nanogent/providers
 ln -s $REPO/history          .nanogent/history
-ln -s $REPO/memory           .nanogent/memory
 
 # Copy user-owned files so you can customise without dirtying the repo
 cp $REPO/prompt.md     .nanogent/prompt.md
@@ -1040,7 +1143,7 @@ nanogent build    # regenerates .nanogent/Dockerfile.generated from the symlinks
 nanogent start    # docker compose up --build
 ```
 
-Now you can edit anything under `template/` in your editor, Ctrl+C the process, relaunch, and the changes are live — no `nanogent update`, no copy step, no byte-compare skip. All mutable state (`.nanogent/state/`, history JSONL, memory files) lands in `/tmp/ng-dev/`, so the repo working tree stays clean. To reset: `rm -rf /tmp/ng-dev`.
+Now you can edit anything under `template/` in your editor, Ctrl+C the process, relaunch, and the changes are live — no `nanogent update`, no copy step, no byte-compare skip. All mutable state (`.nanogent/state/`, history JSONL, plugin-owned `state/` dirs) lands in `/tmp/ng-dev/`, so the repo working tree stays clean. To reset: `rm -rf /tmp/ng-dev`.
 
 Use a **throwaway bot token** and a bot that only you can message. If you add a new file or plugin directory under `template/`, remember to add a matching symlink in the scratch dir.
 

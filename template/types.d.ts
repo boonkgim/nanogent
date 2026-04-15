@@ -101,17 +101,39 @@ export interface ToolResult {
 // that needs a background loop (timers, watchers, pollers) owns it inside
 // start() and returns a stop fn for clean shutdown. Core provides primitives
 // (`fireSystemTurn` to inject non-user turns, `pluginDir` for self-owned
-// state) and never reaches into the tool's folder. See DESIGN.md DR-014.
+// state, `history` for tools that want to read or index the append log) and
+// never reaches into the tool's folder. See DESIGN.md DR-014.
 export interface ToolStartCtx {
   projectName: string;
   projectDir: string;
   pluginDir: string;               // the tool's own folder — put runtime data under pluginDir/state/
+  history: HistoryStorePlugin;     // handle for tools that maintain derived indexes (RAG, summary, etc.)
   fireSystemTurn(opts: {
     channel: string;
     chatId: string;
     contactId: string;
     text: string;
   }): void;
+  log(...args: unknown[]): void;
+}
+
+// Per-turn context for ToolPlugin.contributeContext() — the hook that lets
+// any tool inject an extra system-prompt text block into the next provider
+// call without being invoked by the LLM. Used by RAG/summary/clock/location
+// tools that want to push context into the turn reactively. See DESIGN.md
+// DR-016.
+//
+// The injection surface is text only: tools return a string that core
+// appends after the base system prompt. Tools MUST NOT attempt to mutate
+// the messages array — that is core's correctness invariant (the history
+// store owns it, boundary-aware rotation keeps it valid).
+export interface ToolContextCtx {
+  projectName: string;
+  contactId: string;
+  channel: string;
+  chatId: string;
+  query: string;                                   // latest user text — useful for RAG relevance ranking
+  messages: ReadonlyArray<HistoryMessage>;         // the current window the LLM will see this turn (read-only)
   log(...args: unknown[]): void;
 }
 
@@ -125,6 +147,18 @@ export interface ToolPlugin {
   // void) — core calls it during shutdown. Failures inside start() are
   // logged but do not block boot.
   start?(ctx: ToolStartCtx): Promise<(() => void) | void>;
+  // Optional per-turn hook — called once before provider.chat() on every
+  // turn. Return a text block to inject into the system prompt, or null to
+  // skip this turn. Failures are logged and the tool's contribution is
+  // skipped — the turn proceeds. See DESIGN.md DR-016.
+  contributeContext?(ctx: ToolContextCtx): Promise<string | null>;
+  // Optional history-lifecycle hooks — called after the named operation
+  // commits against the history store. Tools that maintain derived state
+  // (vector indexes, summaries) use these to stay in sync. Failures are
+  // logged but do not block the turn.
+  onHistoryAppended?(contactId: string, messages: HistoryMessage[]): Promise<void>;
+  onHistoryRetracted?(contactId: string, count: number): Promise<void>;
+  onClear?(contactId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,42 +231,18 @@ export interface HistoryStorePlugin {
 }
 
 // ---------------------------------------------------------------------------
-// Memory plugin contract — indexer + retriever over history
+// Context injection — how tools surface extra system-prompt text per turn
 // ---------------------------------------------------------------------------
 //
-// A memory plugin decides what context to surface for the next turn. Naive
-// implementations just return the last N messages from the history store.
-// Smarter ones (vector RAG, GraphRAG, summarisation, mem0-style) build their
-// own index off the `onAppend` callback and return a filtered subset plus
-// optional `systemContext` text injected into the system prompt.
+// There is no "memory plugin" type. Core always windows raw history via
+// boundary-aware rotation; any tool that wants to push additional context
+// into the next turn (RAG retrievers, summary recall, clock, location,
+// status pollers) implements the optional `contributeContext()` hook on
+// ToolPlugin above. Smarter retrievers maintain their own index via the
+// optional onHistoryAppended/onHistoryRetracted/onClear hooks.
 //
-// Exactly one memory plugin is active per install. See DESIGN.md DR-009b.
-
-export interface MemoryCtx {
-  projectName: string;
-  projectDir: string;
-  pluginDir: string;               // the plugin's own folder — put runtime data under pluginDir/state/
-  history: HistoryStorePlugin;     // injected — memory plugins read history via this handle
-  log(...args: unknown[]): void;
-}
-
-export interface RecallResult {
-  messages: HistoryMessage[];      // goes into provider.chat({ messages })
-  systemContext?: string;          // optional extra text appended to the system prompt
-}
-
-export interface MemoryPlugin {
-  name: string;
-  init(ctx: MemoryCtx): Promise<void>;
-  // Called at turn start. `query` is the latest user text (useful for RAG relevance ranking).
-  recall(contactId: string, query: string): Promise<RecallResult>;
-  // Called whenever new messages are appended to history. Index them if you want.
-  onAppend(contactId: string, messages: HistoryMessage[]): Promise<void>;
-  // Called when the last N appended messages are being retracted (skip / error recovery).
-  onRetract(contactId: string, count: number): Promise<void>;
-  // Called by /clear.
-  onClear(contactId: string): Promise<void>;
-}
+// See DESIGN.md DR-016 for the rationale and DR-014 for the coupling
+// principle this enforces.
 
 // ---------------------------------------------------------------------------
 // contacts.json shape

@@ -1,13 +1,17 @@
 // nanogent.ts — per-project chat agent core runtime.
 //
 // Owns:
-//   - plugin loaders (tools / channels / providers / history / memory)
+//   - plugin loaders (tools / channels / providers / history)
 //   - contacts.json parsing + access control
 //   - turn queue + per-contact turn routing
 //   - chat-agent tool-use loop (delegates one round-trip at a time to provider)
+//   - boundary-aware history windowing (rotateHistory) — a correctness
+//     invariant of the Anthropic API, not a retrieval strategy
 //   - core tools (skip, check_job_status, cancel_job, learn)
 //   - job registry with crash recovery + async completion routing
 //   - tool lifecycle orchestration (start/stop) + fireSystemTurn primitive
+//   - per-turn gathering of ToolPlugin.contributeContext() text blocks
+//   - fan-out of history-lifecycle hooks (appended/retracted/clear) to tools
 //   - slash commands
 //
 // Does NOT own:
@@ -15,7 +19,7 @@
 //   - any specific AI provider (that's in .nanogent/providers/<name>/)
 //   - any specific capability (that's in .nanogent/tools/<name>/)
 //   - history storage format (that's in .nanogent/history/<name>/)
-//   - retrieval / windowing / RAG (that's in .nanogent/memory/<name>/)
+//   - retrieval / RAG / summary (that's a tool concern — see DR-016)
 //   - time-based proactive triggers (that's a self-contained tool; see
 //     .nanogent/tools/schedule/ and DR-010/DR-014)
 //
@@ -30,8 +34,8 @@ import { randomUUID } from 'node:crypto';
 
 import type {
   ActiveJob, AccessDecision, ChannelCtx, ChannelPlugin, ChatEntry, Config, Contacts,
-  ContentBlock, HistoryMessage, HistoryStorePlugin, IncomingMessage, MemoryPlugin,
-  ProviderPlugin, TextBlock, ToolCtx, ToolPlugin, ToolSchema, ToolStartCtx,
+  ContentBlock, HistoryMessage, HistoryStorePlugin, IncomingMessage,
+  ProviderPlugin, TextBlock, ToolContextCtx, ToolCtx, ToolPlugin, ToolSchema, ToolStartCtx,
   ToolUseBlock,
 } from './types.d.ts';
 
@@ -47,18 +51,20 @@ const TOOLS_DIR      = '.nanogent/tools';
 const CHANNELS_DIR   = '.nanogent/channels';
 const PROVIDERS_DIR  = '.nanogent/providers';
 const HISTORY_DIR    = '.nanogent/history';
-const MEMORY_DIR     = '.nanogent/memory';
 const STATE_DIR      = '.nanogent/state';
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
 const JOBS_PATH      = `${STATE_DIR}/jobs.json`;
+
+const DEFAULT_HISTORY_WINDOW = 80;
 
 // Module-level runtime state. Populated by bootstrap() so that importing this
 // module from tests has no filesystem side effects.
 let config: Config = {};
 let contacts: Contacts = { alwaysAllowed: ['skip'], users: {}, chats: {} };
-let PROJECT_NAME = 'nanogent';
-let CHAT_MODEL   = 'claude-haiku-4-5';
-let MAX_TOKENS   = 1024;
+let PROJECT_NAME   = 'nanogent';
+let CHAT_MODEL     = 'claude-haiku-4-5';
+let MAX_TOKENS     = 1024;
+let HISTORY_WINDOW = DEFAULT_HISTORY_WINDOW;
 
 function bootstrap(): void {
   mkdirSync(STATE_DIR, { recursive: true });
@@ -74,6 +80,9 @@ function bootstrap(): void {
   PROJECT_NAME = config.projectName || 'nanogent';
   CHAT_MODEL   = process.env.NANOGENT_CHAT_MODEL  || config.chatModel   || 'claude-haiku-4-5';
   MAX_TOKENS   = Number(process.env.NANOGENT_MAX_TOKENS  || config.maxTokens  || 1024);
+
+  const envWindow = Number(process.env.NANOGENT_HISTORY_WINDOW);
+  HISTORY_WINDOW = !Number.isNaN(envWindow) && envWindow > 0 ? envWindow : DEFAULT_HISTORY_WINDOW;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +210,42 @@ export function unique<T>(arr: T[]): T[] {
 }
 
 // ---------------------------------------------------------------------------
+// Boundary-aware history windowing
+// ---------------------------------------------------------------------------
+//
+// Core always reads the last N messages from the history store and rotates
+// them so we never hand the Anthropic API an orphan tool_result at the head
+// (which the API rejects). This is a correctness invariant — not a
+// retrieval strategy — so it lives in core. Smarter retrieval (RAG, summary,
+// mem0) is a tool concern: see ToolPlugin.contributeContext and DR-016.
+
+export function isTurnStart(message: HistoryMessage): boolean {
+  if (message.role !== 'user') return false;
+  if (typeof message.content === 'string') return true;
+  if (!Array.isArray(message.content)) return false;
+  return !message.content.some((b: ContentBlock) => b?.type === 'tool_result');
+}
+
+/**
+ * Return the most recent `window` messages, but never leave an orphan
+ * tool_result at the head. Scans forward from the naive cut point to the
+ * next turn-start; if none found, returns an empty array.
+ */
+export function rotateHistory(h: HistoryMessage[], window: number): HistoryMessage[] {
+  if (h.length <= window) return h;
+  const minStart = h.length - window;
+  for (let i = minStart; i < h.length; i++) {
+    const msg = h[i];
+    if (msg && isTurnStart(msg)) return h.slice(i);
+  }
+  for (let i = h.length - 1; i >= 0; i--) {
+    const msg = h[i];
+    if (msg && isTurnStart(msg)) return h.slice(i);
+  }
+  return [];
+}
+
+// ---------------------------------------------------------------------------
 // Plugin loaders
 // ---------------------------------------------------------------------------
 
@@ -209,7 +254,6 @@ const toolDirs = new Map<string, string>();
 const channels = new Map<string, ChannelPlugin>();
 let provider: ProviderPlugin | null = null;
 let history: HistoryStorePlugin | null = null;
-let memory: MemoryPlugin | null = null;
 
 interface LoadedPlugin<T> {
   plugin: T;
@@ -336,28 +380,6 @@ async function loadAllPlugins(): Promise<void> {
     log:         (...args) => { log(`[history:${history!.name}]`, ...args); },
   });
   log(`loaded history: ${history.name}`);
-
-  // Memory plugins — exactly one
-  const memoryEntries = await loadPluginsFromDir<MemoryPlugin>(MEMORY_DIR, 'memory');
-  if (memoryEntries.length === 0) {
-    die('no memory plugin loaded — install exactly one memory plugin under .nanogent/memory/');
-  }
-  if (memoryEntries.length > 1) {
-    log(`warning: multiple memory plugins found (${memoryEntries.map(m => m.plugin.name).join(', ')}) — using first: ${memoryEntries[0]!.plugin.name}`);
-  }
-  const memoryEntry = memoryEntries[0]!;
-  memory = memoryEntry.plugin;
-  if (typeof memory.recall !== 'function') {
-    die(`memory ${memory.name}: missing recall() method`);
-  }
-  await memory.init({
-    projectName: PROJECT_NAME,
-    projectDir:  process.cwd(),
-    pluginDir:   memoryEntry.dir,
-    history,
-    log:         (...args) => { log(`[memory:${memory!.name}]`, ...args); },
-  });
-  log(`loaded memory: ${memory.name}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +394,7 @@ async function loadAllPlugins(): Promise<void> {
 const toolStopFns: Array<{ name: string; stop: () => void }> = [];
 
 async function startTools(): Promise<void> {
+  if (!history) throw new Error('startTools called before history loaded');
   for (const [name, tool] of tools) {
     const t = tool as ToolPlugin;
     if (typeof t.start !== 'function') continue;
@@ -381,6 +404,7 @@ async function startTools(): Promise<void> {
       projectName: PROJECT_NAME,
       projectDir:  process.cwd(),
       pluginDir:   toolDir,
+      history,
       fireSystemTurn,
       log:         (...args) => { log(`[tool:${name}]`, ...args); },
     };
@@ -391,6 +415,16 @@ async function startTools(): Promise<void> {
     } catch (e) {
       log(`tool ${name} start() failed —`, (e as Error)?.message || e);
     }
+  }
+}
+
+// Iterate loaded ToolPlugin instances (skipping the core ToolSchema entries
+// registered at the top of loadAllPlugins, which have no execute() and no
+// lifecycle hooks). Used by the hook-fanout helpers below.
+function* loadedToolPlugins(): IterableIterator<{ name: string; plugin: ToolPlugin }> {
+  for (const [name, tool] of tools) {
+    if (!toolDirs.has(name)) continue; // core tool (skip / check_job_status / cancel_job / learn)
+    yield { name, plugin: tool as ToolPlugin };
   }
 }
 
@@ -581,7 +615,7 @@ function makeToolCtx(origin: Origin, toolDir: string): ToolCtx {
 // Chat-agent turn execution
 // ---------------------------------------------------------------------------
 
-function buildSystemPrompt(memoryContext?: string): TextBlock[] {
+function buildSystemPrompt(contextBlocks: string[]): TextBlock[] {
   const base = existsSync(PROMPT_PATH) ? readFileSync(PROMPT_PATH, 'utf8') : DEFAULT_SYSTEM_PROMPT;
   const project = `\n\n## Project\nYou are operating inside the "${PROJECT_NAME}" nanogent project.`;
   const learnings = loadLearnings();
@@ -591,45 +625,54 @@ function buildSystemPrompt(memoryContext?: string): TextBlock[] {
   const learnSection = learnings.trim() ? `\n\n${learnings.trim()}` : '';
   const dynamic = `${project}${learnSection}${jobState}`;
   // Cache breakpoint goes on the stable base prompt only. The dynamic core
-  // block (learnings + job state) and the memory plugin's systemContext sit
-  // after the breakpoint because they can change between turns.
+  // block (learnings + job state) and the per-turn tool context sit after
+  // the breakpoint because they can change between turns.
   const blocks: TextBlock[] = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
   if (dynamic) blocks.push({ type: 'text', text: dynamic });
-  if (memoryContext && memoryContext.trim()) {
-    blocks.push({ type: 'text', text: `\n\n## Memory\n${memoryContext.trim()}` });
+  for (const c of contextBlocks) {
+    const trimmed = c?.trim();
+    if (trimmed) blocks.push({ type: 'text', text: `\n\n${trimmed}` });
   }
   return blocks;
 }
 
 /**
- * Commit new messages to the history store, then notify the memory plugin.
- * History is the source of truth; memory is a derived view. If the memory
- * index fails to update, we log and continue — it can be rebuilt from history.
+ * Commit new messages to the history store, then fan out
+ * onHistoryAppended hooks to any tool that subscribes. History is the
+ * source of truth; tool-owned indexes (RAG, summary) are derived views
+ * and may be rebuilt from history if they drift.
  */
 async function commitMessages(contactId: string, messages: HistoryMessage[]): Promise<void> {
-  if (!history || !memory) throw new Error('history/memory not loaded');
+  if (!history) throw new Error('history not loaded');
   if (messages.length === 0) return;
   await history.append(contactId, messages);
-  try {
-    await memory.onAppend(contactId, messages);
-  } catch (e) {
-    log(`memory onAppend error (${contactId}):`, (e as Error)?.message || e);
-  }
+  await Promise.all(
+    [...loadedToolPlugins()]
+      .filter(({ plugin }) => typeof plugin.onHistoryAppended === 'function')
+      .map(async ({ name, plugin }) => {
+        try { await plugin.onHistoryAppended!(contactId, messages); }
+        catch (e) { log(`tool ${name} onHistoryAppended error (${contactId}):`, (e as Error)?.message || e); }
+      }),
+  );
 }
 
 /**
- * Retract the last `count` messages from history and tell memory to
- * invalidate its index entries for them. Used by skip + error recovery.
+ * Retract the last `count` messages from history and fire
+ * onHistoryRetracted hooks so any tool-owned index can invalidate its
+ * entries for them. Used by skip + error recovery.
  */
 async function retractMessages(contactId: string, count: number): Promise<void> {
-  if (!history || !memory) throw new Error('history/memory not loaded');
+  if (!history) throw new Error('history not loaded');
   if (count <= 0) return;
   await history.retractLast(contactId, count);
-  try {
-    await memory.onRetract(contactId, count);
-  } catch (e) {
-    log(`memory onRetract error (${contactId}):`, (e as Error)?.message || e);
-  }
+  await Promise.all(
+    [...loadedToolPlugins()]
+      .filter(({ plugin }) => typeof plugin.onHistoryRetracted === 'function')
+      .map(async ({ name, plugin }) => {
+        try { await plugin.onHistoryRetracted!(contactId, count); }
+        catch (e) { log(`tool ${name} onHistoryRetracted error (${contactId}):`, (e as Error)?.message || e); }
+      }),
+  );
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are a friendly project assistant talking to a client via chat. You have access to tools for doing real work — prefer calling them over making things up. If a message is side chatter not addressed to you, call skip. User messages are always prefixed with [Name]: — use the name to address speakers and tell participants apart in group chats.`;
@@ -654,10 +697,18 @@ function toolSchemasFor(effectiveTools: string[]): ToolSchema[] {
  * Returns the assistant text to send back (or null if skipped).
  *
  * The caller must have already committed the triggering user message via
- * commitMessages() before invoking runTurn — this way runTurn's own recall()
- * call sees it. `triggerMessageCount` is how many messages the caller
+ * commitMessages() before invoking runTurn — this way the history read
+ * below sees it. `triggerMessageCount` is how many messages the caller
  * appended for this turn (typically 1), so skip/error paths can retract
  * them cleanly.
+ *
+ * Context assembly for the turn:
+ *   1. Pull the last (window * 2) messages from the history store and run
+ *      boundary-aware rotation — this is the base window the LLM sees.
+ *   2. Gather optional contributeContext() text from every loaded tool in
+ *      parallel; concatenate successful results into the system prompt.
+ *      Failing tools are logged and skipped — the turn still runs.
+ * See DR-016 for the rationale.
  */
 async function runTurn(
   origin: Origin,
@@ -665,18 +716,41 @@ async function runTurn(
   triggerMessageCount: number,
   queryText: string,
 ): Promise<string | null> {
-  if (!provider || !memory) throw new Error('provider/memory not loaded');
+  if (!provider) throw new Error('provider not loaded');
+  if (!history) throw new Error('history not loaded');
   const toolList = toolSchemasFor(effectiveTools);
 
-  // Ask the memory plugin for the context to send this turn. `queryText`
-  // is the plain latest user text — RAG plugins use it for relevance ranking.
-  const recalled = await memory.recall(origin.contactId, queryText);
-  const messages: HistoryMessage[] = recalled.messages.slice();
+  // Core-owned base window. Pull a buffer slightly larger than the window
+  // so boundary-aware rotation has room to walk forward to the next
+  // turn-start.
+  const raw = await history.read(origin.contactId, { limit: HISTORY_WINDOW * 2 });
+  const messages: HistoryMessage[] = rotateHistory(raw, HISTORY_WINDOW).slice();
+
+  // Gather per-turn tool context blocks in parallel. Each tool that
+  // implements contributeContext() gets one call, wrapped in try/catch so a
+  // buggy tool degrades its own contribution but never crashes the turn.
+  const contextCtx: ToolContextCtx = {
+    projectName: PROJECT_NAME,
+    contactId:   origin.contactId,
+    channel:     origin.channel,
+    chatId:      origin.chatId,
+    query:       queryText,
+    messages,
+    log:         (...args) => { log(`[ctx:${origin.contactId}]`, ...args); },
+  };
+  const contextBlocks = (await Promise.all(
+    [...loadedToolPlugins()]
+      .filter(({ plugin }) => typeof plugin.contributeContext === 'function')
+      .map(async ({ name, plugin }) => {
+        try { return await plugin.contributeContext!(contextCtx); }
+        catch (e) { log(`tool ${name} contributeContext error (${origin.contactId}):`, (e as Error)?.message || e); return null; }
+      }),
+  )).filter((b): b is string => typeof b === 'string' && b.trim().length > 0);
 
   let response = await provider.chat({
     model:     CHAT_MODEL,
     maxTokens: MAX_TOKENS,
-    system:    buildSystemPrompt(recalled.systemContext),
+    system:    buildSystemPrompt(contextBlocks),
     messages,
     tools:     toolList,
   });
@@ -712,7 +786,7 @@ async function runTurn(
     response = await provider.chat({
       model:     CHAT_MODEL,
       maxTokens: MAX_TOKENS,
-      system:    buildSystemPrompt(recalled.systemContext),
+      system:    buildSystemPrompt(contextBlocks),
       messages,
       tools:     toolList,
     });
@@ -770,9 +844,9 @@ async function kickTurnWorker(): Promise<void> {
  * any tool that runs proactive loops (the bundled `schedule` tool today,
  * future webhooks / watchers / pollers) can drive the runtime without faking
  * a user message. The resulting turn goes through the same per-contact
- * serializer, memory recall, tool-use loop, and channel send pipeline as a
- * normal user turn; the only difference is the trigger text is framed as a
- * system message rather than `[Name]: ...`.
+ * serializer, history window, contributeContext gather, tool-use loop, and
+ * channel send pipeline as a normal user turn; the only difference is the
+ * trigger text is framed as a system message rather than `[Name]: ...`.
  *
  * Not exported: plugins reach it through their start() ctx, not by importing
  * core. See DESIGN.md DR-014.
@@ -861,10 +935,14 @@ async function handleSlash(text: string, origin: Origin): Promise<void> {
   if (text === '/clear') {
     if (activeJob) { await say('⚠️ a job is running — /cancel first, then /clear'); return; }
     if (history) await history.clear(origin.contactId);
-    if (memory) {
-      try { await memory.onClear(origin.contactId); }
-      catch (e) { log('memory onClear error', (e as Error)?.message || e); }
-    }
+    await Promise.all(
+      [...loadedToolPlugins()]
+        .filter(({ plugin }) => typeof plugin.onClear === 'function')
+        .map(async ({ name, plugin }) => {
+          try { await plugin.onClear!(origin.contactId); }
+          catch (e) { log(`tool ${name} onClear error (${origin.contactId}):`, (e as Error)?.message || e); }
+        }),
+    );
     await say('✨ history cleared — next message starts fresh');
     return;
   }
