@@ -1,7 +1,6 @@
 // Unit tests for the pure helpers exported from the nanogent core. Covers
-// the three-layer permission model (DR-005), boundary-aware history
-// rotation (DR-016 — now owned by core, not by a memory plugin), and the
-// .env parser.
+// the three-layer permission model (DR-005), token-budgeted boundary-aware
+// history windowing, and the .env parser.
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +11,7 @@ import { join } from 'node:path';
 import {
   findChat, resolveAccess, sanitize, unique,
   loadEnv, loadConfig, loadContacts,
-  rotateHistory, isTurnStart,
+  windowByTokens, isTurnStart, estimateTokens,
 } from '../template/nanogent.ts';
 import type { Contacts, HistoryMessage } from '../template/types.d.ts';
 
@@ -200,10 +199,10 @@ describe('resolveAccess', () => {
 });
 
 // ---------------------------------------------------------------------------
-// rotateHistory (boundary-aware truncation)
+// windowByTokens (token-budgeted, boundary-aware windowing)
 // ---------------------------------------------------------------------------
 
-describe('rotateHistory', () => {
+describe('windowByTokens', () => {
   const userText = (text: string): HistoryMessage => ({ role: 'user', content: text });
   const assistantText = (text: string): HistoryMessage => ({ role: 'assistant', content: text });
   const toolResult = (): HistoryMessage => ({
@@ -211,26 +210,27 @@ describe('rotateHistory', () => {
     content: [{ type: 'tool_result', tool_use_id: 'x', content: 'ok' }],
   });
 
-  it('returns input unchanged when under limit', () => {
+  it('returns input unchanged when under budget', () => {
     const h = [userText('a'), assistantText('b')];
-    assert.deepEqual(rotateHistory(h, 10), h);
+    const { window } = windowByTokens(h, 100_000);
+    assert.deepEqual(window, h);
   });
 
-  it('trims oldest turns when over limit', () => {
+  it('trims oldest turns when over budget', () => {
     const h = [
       userText('t1'), assistantText('r1'),
       userText('t2'), assistantText('r2'),
       userText('t3'), assistantText('r3'),
     ];
-    const result = rotateHistory(h, 4);
-    assert.equal(result.length, 4);
-    assert.equal((result[0] as HistoryMessage).content, 't2');
+    // Use a budget that fits ~4 messages but not all 6
+    const totalTokens = estimateTokens(h);
+    const budget = Math.floor(totalTokens * 0.7);
+    const { window } = windowByTokens(h, budget);
+    assert.ok(window.length < h.length, 'should trim some messages');
+    assert.ok(isTurnStart(window[0]!), 'first message must be a turn-start');
   });
 
   it('never leaves an orphan tool_result at head', () => {
-    // History: [user-turn, assistant-tool-use, tool-result, assistant-text]
-    // With maxHistory=2, the naive slice would leave [tool_result, assistant]
-    // which is malformed. rotateHistory must scan forward to next turn-start.
     const h = [
       userText('start'),
       assistantText('mid'),
@@ -239,19 +239,28 @@ describe('rotateHistory', () => {
       userText('next'),
       assistantText('reply'),
     ];
-    const result = rotateHistory(h, 3);
-    // Must start on a user-turn-start (text, not tool_result)
-    const first = result[0];
+    // Budget that would naively cut into the tool_result
+    const lastThreeTokens = estimateTokens(h.slice(3));
+    const { window } = windowByTokens(h, lastThreeTokens + 1);
+    const first = window[0];
     assert.ok(first);
     assert.ok(isTurnStart(first), 'first message must be a turn-start');
   });
 
-  it('returns empty array if no turn-start found within window', () => {
-    // Edge case: history is pathologically all tool_results (shouldn't happen
-    // in practice, but we check the fallback)
+  it('returns empty window if no turn-start found', () => {
     const h = [toolResult(), toolResult(), toolResult()];
-    const result = rotateHistory(h, 1);
-    assert.deepEqual(result, []);
+    const { window } = windowByTokens(h, 10);
+    assert.deepEqual(window, []);
+  });
+
+  it('returns startIndex for summary tracking', () => {
+    const h = [
+      userText('old1'), assistantText('old2'),
+      userText('new1'), assistantText('new2'),
+    ];
+    const lastTwoTokens = estimateTokens(h.slice(2));
+    const { startIndex } = windowByTokens(h, lastTwoTokens + 1);
+    assert.ok(startIndex >= 2, 'startIndex should be at or past the old messages');
   });
 });
 

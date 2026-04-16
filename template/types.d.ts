@@ -275,6 +275,10 @@ export interface Config {
   projectName?: string;
   chatModel?: string;
   maxTokens?: number;
+  /** Estimated token budget for the sliding history window (default: 150000). */
+  tokenWindow?: number;
+  /** Summarize when this many estimated tokens fall off the window (default: 50000). */
+  summaryThreshold?: number;
 }
 
 // ---------------------------------------------------------------------------

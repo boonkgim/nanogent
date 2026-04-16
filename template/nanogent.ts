@@ -5,8 +5,8 @@
 //   - contacts.json parsing + access control
 //   - turn queue + per-contact turn routing
 //   - chat-agent tool-use loop (delegates one round-trip at a time to provider)
-//   - boundary-aware history windowing (rotateHistory) — a correctness
-//     invariant of the Anthropic API, not a retrieval strategy
+//   - token-budgeted, boundary-aware history windowing (windowByTokens)
+//   - incremental conversation summary (covers messages before the window)
 //   - core tools (skip, check_job_status, cancel_job, learn)
 //   - job registry with crash recovery + async completion routing
 //   - tool lifecycle orchestration (start/stop) + fireSystemTurn primitive
@@ -19,7 +19,7 @@
 //   - any specific AI provider (that's in .nanogent/providers/<name>/)
 //   - any specific capability (that's in .nanogent/tools/<name>/)
 //   - history storage format (that's in .nanogent/history/<name>/)
-//   - retrieval / RAG / summary (that's a tool concern — see DR-016)
+//   - retrieval / RAG (that's a tool concern — see DR-016)
 //   - time-based proactive triggers (that's a self-contained tool; see
 //     .nanogent/tools/schedule/ and DR-010/DR-014)
 //
@@ -55,16 +55,18 @@ const STATE_DIR      = '.nanogent/state';
 const LEARNINGS_PATH = `${STATE_DIR}/learnings.md`;
 const JOBS_PATH      = `${STATE_DIR}/jobs.json`;
 
-const DEFAULT_HISTORY_WINDOW = 80;
+const DEFAULT_TOKEN_WINDOW     = 150_000;
+const DEFAULT_SUMMARY_THRESHOLD = 50_000;
 
 // Module-level runtime state. Populated by bootstrap() so that importing this
 // module from tests has no filesystem side effects.
 let config: Config = {};
 let contacts: Contacts = { alwaysAllowed: ['skip'], users: {}, chats: {} };
-let PROJECT_NAME   = 'nanogent';
-let CHAT_MODEL     = 'claude-haiku-4-5';
-let MAX_TOKENS     = 1024;
-let HISTORY_WINDOW = DEFAULT_HISTORY_WINDOW;
+let PROJECT_NAME        = 'nanogent';
+let CHAT_MODEL          = 'claude-haiku-4-5';
+let MAX_TOKENS          = 1024;
+let TOKEN_WINDOW        = DEFAULT_TOKEN_WINDOW;
+let SUMMARY_THRESHOLD   = DEFAULT_SUMMARY_THRESHOLD;
 
 function bootstrap(): void {
   mkdirSync(STATE_DIR, { recursive: true });
@@ -81,8 +83,15 @@ function bootstrap(): void {
   CHAT_MODEL   = process.env.NANOGENT_CHAT_MODEL  || config.chatModel   || 'claude-haiku-4-5';
   MAX_TOKENS   = Number(process.env.NANOGENT_MAX_TOKENS  || config.maxTokens  || 1024);
 
-  const envWindow = Number(process.env.NANOGENT_HISTORY_WINDOW);
-  HISTORY_WINDOW = !Number.isNaN(envWindow) && envWindow > 0 ? envWindow : DEFAULT_HISTORY_WINDOW;
+  const envTokenWindow = Number(process.env.NANOGENT_TOKEN_WINDOW);
+  TOKEN_WINDOW = !Number.isNaN(envTokenWindow) && envTokenWindow > 0
+    ? envTokenWindow
+    : (config.tokenWindow || DEFAULT_TOKEN_WINDOW);
+
+  const envSummaryThreshold = Number(process.env.NANOGENT_SUMMARY_THRESHOLD);
+  SUMMARY_THRESHOLD = !Number.isNaN(envSummaryThreshold) && envSummaryThreshold > 0
+    ? envSummaryThreshold
+    : (config.summaryThreshold || DEFAULT_SUMMARY_THRESHOLD);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +111,53 @@ function appendLearning(title: string, content: string): void {
   } else {
     appendFileSync(LEARNINGS_PATH, entry);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Summary management — per-contact incremental conversation summary
+// ---------------------------------------------------------------------------
+//
+// When messages fall off the token window, core incrementally summarizes
+// them so the LLM retains context about older conversation. Summaries are
+// derived views stored in .nanogent/state/ — they can be rebuilt from the
+// raw history log.
+
+interface SummaryState {
+  text: string;
+  /** Messages [0..upToIndex) are covered by this summary. */
+  upToIndex: number;
+  updatedAt: string;
+}
+
+function summaryPath(contactId: string): string {
+  return `${STATE_DIR}/summary-${contactId.replace(/\//g, '__')}.json`;
+}
+
+function loadSummary(contactId: string): SummaryState | null {
+  const p = summaryPath(contactId);
+  if (!existsSync(p)) return null;
+  try { return JSON.parse(readFileSync(p, 'utf8')) as SummaryState; }
+  catch { return null; }
+}
+
+function saveSummary(contactId: string, state: SummaryState): void {
+  writeFileSync(summaryPath(contactId), JSON.stringify(state, null, 2) + '\n');
+}
+
+function clearSummary(contactId: string): void {
+  const p = summaryPath(contactId);
+  if (existsSync(p)) { try { unlinkSync(p); } catch { /* ignore */ } }
+}
+
+function needsSummarization(
+  allMessages: HistoryMessage[],
+  summary: SummaryState | null,
+  windowStartIndex: number,
+): boolean {
+  const upToIndex = summary?.upToIndex ?? 0;
+  if (windowStartIndex <= upToIndex) return false;
+  const unsummarized = allMessages.slice(upToIndex, windowStartIndex);
+  return estimateTokens(unsummarized) >= SUMMARY_THRESHOLD;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,13 +266,50 @@ export function unique<T>(arr: T[]): T[] {
 }
 
 // ---------------------------------------------------------------------------
-// Boundary-aware history windowing
+// Token estimation — rough but good enough for windowing decisions (~4 chars/token)
+// ---------------------------------------------------------------------------
+
+function estimateBlockTokens(block: ContentBlock): number {
+  if (!block || typeof block !== 'object') return 0;
+  switch (block.type) {
+    case 'text':
+      return Math.ceil(((block as TextBlock).text?.length || 0) / 4);
+    case 'tool_use': {
+      const tu = block as ToolUseBlock;
+      return Math.ceil(((tu.name?.length || 0) + JSON.stringify(tu.input || {}).length) / 4);
+    }
+    case 'tool_result':
+      return Math.ceil((typeof block.content === 'string' ? block.content.length : JSON.stringify(block.content || '').length) / 4);
+    default:
+      return Math.ceil(JSON.stringify(block).length / 4);
+  }
+}
+
+export function estimateTokens(messages: HistoryMessage[]): number {
+  let tokens = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === 'string') {
+      tokens += Math.ceil(msg.content.length / 4);
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        tokens += estimateBlockTokens(block);
+      }
+    } else {
+      tokens += Math.ceil(JSON.stringify(msg.content).length / 4);
+    }
+    tokens += 4; // role overhead
+  }
+  return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// Boundary-aware token-windowed history
 // ---------------------------------------------------------------------------
 //
-// Core always reads the last N messages from the history store and rotates
-// them so we never hand the Anthropic API an orphan tool_result at the head
-// (which the API rejects). This is a correctness invariant — not a
-// retrieval strategy — so it lives in core. Smarter retrieval (RAG, summary,
+// Core always reads all messages from the history store and selects a
+// token-budgeted window from the tail, ensuring the head is never an orphan
+// tool_result (which the Anthropic API rejects). This is a correctness
+// invariant — not a retrieval strategy. Smarter retrieval (RAG, summary,
 // mem0) is a tool concern: see ToolPlugin.contributeContext and DR-016.
 
 export function isTurnStart(message: HistoryMessage): boolean {
@@ -227,22 +320,43 @@ export function isTurnStart(message: HistoryMessage): boolean {
 }
 
 /**
- * Return the most recent `window` messages, but never leave an orphan
- * tool_result at the head. Scans forward from the naive cut point to the
- * next turn-start; if none found, returns an empty array.
+ * Return the most recent messages fitting within `tokenBudget`, but never
+ * leave an orphan tool_result at the head. Returns the window and the
+ * index into the full array where the window starts.
  */
-export function rotateHistory(h: HistoryMessage[], window: number): HistoryMessage[] {
-  if (h.length <= window) return h;
-  const minStart = h.length - window;
-  for (let i = minStart; i < h.length; i++) {
-    const msg = h[i];
-    if (msg && isTurnStart(msg)) return h.slice(i);
-  }
+export function windowByTokens(
+  h: HistoryMessage[],
+  tokenBudget: number,
+): { window: HistoryMessage[]; startIndex: number } {
+  if (h.length === 0) return { window: [], startIndex: 0 };
+
+  // Walk backward from end, accumulating estimated tokens
+  let tokens = 0;
+  let rawStart = h.length;
   for (let i = h.length - 1; i >= 0; i--) {
-    const msg = h[i];
-    if (msg && isTurnStart(msg)) return h.slice(i);
+    const msgTokens = estimateTokens([h[i]!]);
+    if (tokens + msgTokens > tokenBudget) break;
+    tokens += msgTokens;
+    rawStart = i;
   }
-  return [];
+
+  // Boundary correction: scan forward to next clean turn start
+  let startIndex = rawStart;
+  while (startIndex < h.length && !isTurnStart(h[startIndex]!)) {
+    startIndex++;
+  }
+
+  // If we couldn't find one scanning forward, scan backward from end
+  if (startIndex >= h.length) {
+    for (let i = h.length - 1; i >= 0; i--) {
+      if (isTurnStart(h[i]!)) { startIndex = i; break; }
+    }
+  }
+
+  // Last resort: empty window
+  if (startIndex >= h.length) return { window: [], startIndex: h.length };
+
+  return { window: h.slice(startIndex), startIndex };
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +729,7 @@ function makeToolCtx(origin: Origin, toolDir: string): ToolCtx {
 // Chat-agent turn execution
 // ---------------------------------------------------------------------------
 
-function buildSystemPrompt(contextBlocks: string[]): TextBlock[] {
+function buildSystemPrompt(contextBlocks: string[], summaryText?: string): TextBlock[] {
   const base = existsSync(PROMPT_PATH) ? readFileSync(PROMPT_PATH, 'utf8') : DEFAULT_SYSTEM_PROMPT;
   const project = `\n\n## Project\nYou are operating inside the "${PROJECT_NAME}" nanogent project.`;
   const learnings = loadLearnings();
@@ -623,10 +737,11 @@ function buildSystemPrompt(contextBlocks: string[]): TextBlock[] {
     ? `\n\n## Current state\nA background job is running: "${activeJob.title}" (tool=${activeJob.toolName}, id=${activeJob.jobId}). Do not start another job of the same kind — ask the user or call check_job_status.`
     : '';
   const learnSection = learnings.trim() ? `\n\n${learnings.trim()}` : '';
-  const dynamic = `${project}${learnSection}${jobState}`;
+  const summarySection = summaryText ? `\n\n## Previous conversation summary\n${summaryText}` : '';
+  const dynamic = `${project}${learnSection}${jobState}${summarySection}`;
   // Cache breakpoint goes on the stable base prompt only. The dynamic core
-  // block (learnings + job state) and the per-turn tool context sit after
-  // the breakpoint because they can change between turns.
+  // block (learnings + job state + summary) and the per-turn tool context sit
+  // after the breakpoint because they can change between turns.
   const blocks: TextBlock[] = [{ type: 'text', text: base, cache_control: { type: 'ephemeral' } }];
   if (dynamic) blocks.push({ type: 'text', text: dynamic });
   for (const c of contextBlocks) {
@@ -703,11 +818,14 @@ function toolSchemasFor(effectiveTools: string[]): ToolSchema[] {
  * them cleanly.
  *
  * Context assembly for the turn:
- *   1. Pull the last (window * 2) messages from the history store and run
- *      boundary-aware rotation — this is the base window the LLM sees.
- *   2. Gather optional contributeContext() text from every loaded tool in
+ *   1. Read all messages from the history store and apply token-budgeted,
+ *      boundary-aware windowing — this is the base window the LLM sees.
+ *   2. Load the conversation summary (covers messages before the window)
+ *      and inject it into the system prompt.
+ *   3. Gather optional contributeContext() text from every loaded tool in
  *      parallel; concatenate successful results into the system prompt.
  *      Failing tools are logged and skipped — the turn still runs.
+ *   4. After the turn, check if incremental summarization is needed.
  * See DR-016 for the rationale.
  */
 async function runTurn(
@@ -720,11 +838,13 @@ async function runTurn(
   if (!history) throw new Error('history not loaded');
   const toolList = toolSchemasFor(effectiveTools);
 
-  // Core-owned base window. Pull a buffer slightly larger than the window
-  // so boundary-aware rotation has room to walk forward to the next
-  // turn-start.
-  const raw = await history.read(origin.contactId, { limit: HISTORY_WINDOW * 2 });
-  const messages: HistoryMessage[] = rotateHistory(raw, HISTORY_WINDOW).slice();
+  // Read all messages and apply token-budgeted, boundary-aware windowing.
+  const allMessages = await history.read(origin.contactId);
+  const { window, startIndex } = windowByTokens(allMessages, TOKEN_WINDOW);
+  const messages: HistoryMessage[] = window.slice();
+
+  // Load conversation summary (covers messages before the window).
+  const summary = loadSummary(origin.contactId);
 
   // Gather per-turn tool context blocks in parallel. Each tool that
   // implements contributeContext() gets one call, wrapped in try/catch so a
@@ -747,10 +867,12 @@ async function runTurn(
       }),
   )).filter((b): b is string => typeof b === 'string' && b.trim().length > 0);
 
+  const systemPrompt = buildSystemPrompt(contextBlocks, summary?.text);
+
   let response = await provider.chat({
     model:     CHAT_MODEL,
     maxTokens: MAX_TOKENS,
-    system:    buildSystemPrompt(contextBlocks),
+    system:    systemPrompt,
     messages,
     tools:     toolList,
   });
@@ -786,7 +908,7 @@ async function runTurn(
     response = await provider.chat({
       model:     CHAT_MODEL,
       maxTokens: MAX_TOKENS,
-      system:    buildSystemPrompt(contextBlocks),
+      system:    systemPrompt,
       messages,
       tools:     toolList,
     });
@@ -794,12 +916,65 @@ async function runTurn(
 
   await commitMessages(origin.contactId, [{ role: 'assistant', content: response.content }]);
 
+  // Check if incremental summarization is needed.
+  void maybeUpdateSummary(origin.contactId, startIndex);
+
   const text = response.content
     .filter((b): b is TextBlock => b.type === 'text')
     .map(b => b.text)
     .join('\n')
     .trim();
   return text || null;
+}
+
+/**
+ * Incrementally summarize messages that fell off the token window.
+ * Runs asynchronously after the turn — does not block the reply.
+ */
+async function maybeUpdateSummary(contactId: string, windowStartIndex: number): Promise<void> {
+  if (!provider || !history) return;
+  const allMessages = await history.read(contactId);
+  const summary = loadSummary(contactId);
+
+  if (!needsSummarization(allMessages, summary, windowStartIndex)) return;
+
+  const upToIndex = summary?.upToIndex ?? 0;
+  const newMessages = allMessages.slice(upToIndex, windowStartIndex);
+  const newTokens = estimateTokens(newMessages);
+
+  log(`[summary:${contactId}] summarizing ${newMessages.length} messages (~${newTokens} tokens)`);
+
+  try {
+    const prevSummary = summary?.text || '';
+    const summarizePrompt = prevSummary
+      ? `You have a previous conversation summary and new messages that came after it. Produce an updated, concise summary that incorporates both.\n\nPrevious summary:\n${prevSummary}\n\nNew messages follow in the conversation below. Summarize the key decisions, changes, and current state.`
+      : 'Summarize this conversation concisely. Include: key decisions, what was changed, current project state, and any pending work.';
+
+    const response = await provider.chat({
+      model:     CHAT_MODEL,
+      maxTokens: 2048,
+      system:    [{ type: 'text', text: summarizePrompt }],
+      messages:  newMessages,
+      tools:     [],
+    });
+
+    const summaryText = response.content
+      .filter((b): b is TextBlock => b.type === 'text')
+      .map(b => b.text)
+      .join('\n')
+      .trim();
+
+    if (summaryText) {
+      saveSummary(contactId, {
+        text: summaryText,
+        upToIndex: windowStartIndex,
+        updatedAt: new Date().toISOString(),
+      });
+      log(`[summary:${contactId}] updated (covers messages 0..${windowStartIndex})`);
+    }
+  } catch (e) {
+    log(`[summary:${contactId}] failed:`, (e as Error)?.message || e);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -935,6 +1110,7 @@ async function handleSlash(text: string, origin: Origin): Promise<void> {
   if (text === '/clear') {
     if (activeJob) { await say('⚠️ a job is running — /cancel first, then /clear'); return; }
     if (history) await history.clear(origin.contactId);
+    clearSummary(origin.contactId);
     await Promise.all(
       [...loadedToolPlugins()]
         .filter(({ plugin }) => typeof plugin.onClear === 'function')
